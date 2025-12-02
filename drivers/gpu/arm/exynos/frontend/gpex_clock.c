@@ -82,6 +82,7 @@ static int gpex_clock_update_config_data_from_dt(void)
 	struct freq_volt *fv_array;
 	int asv_lv_num;
 	int i, j;
+	gpu_clock_info temp;
 
 	clk_info.gpu_max_clock = gpexbe_devicetree_get_int(gpu_max_clock);
 	clk_info.gpu_min_clock = gpexbe_devicetree_get_int(gpu_min_clock);
@@ -118,6 +119,21 @@ static int gpex_clock_update_config_data_from_dt(void)
 	}
 
 	kfree(fv_array);
+
+	if (clk_info.table_size > 1 &&
+	    clk_info.table[0].clock < clk_info.table[clk_info.table_size - 1].clock) {
+		GPU_LOG(MALI_EXYNOS_WARNING,
+			"%s: clock table appears ascending, reversing to keep max-first order\n",
+			__func__);
+
+		for (i = 0; i < clk_info.table_size / 2; i++) {
+			temp = clk_info.table[i];
+			clk_info.table[i] = clk_info.table[clk_info.table_size - 1 - i];
+			clk_info.table[clk_info.table_size - 1 - i] = temp;
+		}
+	}
+
+	gpex_clock_log_table_state("gpex_clock_init_table");
 
 	return 0;
 }

@@ -81,8 +81,7 @@ int gpexbe_clock_set_rate(int clk)
 
 	ret = cal_dfs_set_rate(cal_id, clk);
 	if (!ret)
-	cached_clock = clk;
-
+		cached_clock = clk;
 	gpex_debug_record_time(HIST_CLOCK);
 	gpex_debug_record_code(HIST_CLOCK, ret);
 	gpex_debug_record_new_data(HIST_CLOCK, clk);

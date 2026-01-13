@@ -2,6 +2,18 @@
 #include "cmucal-node.h"
 #include "cmucal-sfr.h"
 
+#define CPUCL1_PLL_RATE_TABLE_ONLY
+#define CPUCL1_PLL_RATE_TABLE_DEFINE
+#include "../cpucl1_dvfs_overrides.h"
+#undef CPUCL1_PLL_RATE_TABLE_DEFINE
+#undef CPUCL1_PLL_RATE_TABLE_ONLY
+
+#define CPUCL2_PLL_RATE_TABLE_ONLY
+#define CPUCL2_PLL_RATE_TABLE_DEFINE
+#include "../cpucl2_dvfs_overrides.h"
+#undef CPUCL2_PLL_RATE_TABLE_DEFINE
+#undef CPUCL2_PLL_RATE_TABLE_ONLY
+
 struct cmucal_pll_table pll_aud0_rate_table[] = {
 	PLL_RATE_MPSK(1179649032, 181, 4, 0, 31750), /*  840ppb */
 	PLL_RATE_MPSK(1179648933, 181, 4, 0, 31749), /*  757ppb */
@@ -95,22 +107,6 @@ struct cmucal_pll_table pll_cpucl0_rate_table[] = {
 struct cmucal_pll_table apll_cpucl0_rate_table[] = {
 	PLL_RATE_MPS(1150499968, 177, 1, 2),
 	PLL_RATE_MPS(26000000, 0, 0, 0),
-};
-
-struct cmucal_pll_table pll_cpucl1_rate_table[] = {
-	PLL_RATE_MPS(2398500096, 369, 4, 0),
-	PLL_RATE_MPS(1799999872, 900, 13, 0),
-	PLL_RATE_MPS(1400000000, 700, 13, 0),
-	PLL_RATE_MPS(800000000, 400, 13, 0),
-	PLL_RATE_MPS(466000000, 233, 13, 0),
-};
-
-struct cmucal_pll_table pll_cpucl2_rate_table[] = {
-	PLL_RATE_MPS(2850249984, 877, 1, 3),
-	PLL_RATE_MPS(2224857088, 599, 7, 0),
-	PLL_RATE_MPS(1834857088, 494, 7, 0),
-	PLL_RATE_MPS(1100000000, 550, 13, 0),
-	PLL_RATE_MPS(533000000, 82, 1, 2),
 };
 
 struct cmucal_pll_table pll_mmc_rate_table[] = {

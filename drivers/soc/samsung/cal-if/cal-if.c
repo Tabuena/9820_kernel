@@ -15,6 +15,8 @@
 #include "ra.h"
 #include "acpm_dvfs.h"
 #include "fvmap.h"
+#include "cpucl1_dvfs_overrides.h"
+#include "cpucl2_dvfs_overrides.h"
 #include "gpu_dvfs_overrides.h"
 #include "asv.h"
 
@@ -41,6 +43,28 @@ static bool cal_is_gpu_dvfs_id(unsigned int id)
 	return !strcmp(vclk->name, "dvfs_g3d");
 }
 
+static bool cal_is_cpucl2_dvfs_id(unsigned int id)
+{
+	struct vclk *vclk;
+
+	vclk = cmucal_get_node(id);
+	if (!vclk || !vclk->name)
+		return false;
+
+	return !strcmp(vclk->name, "dvfs_cpucl2");
+}
+
+static bool cal_is_cpucl1_dvfs_id(unsigned int id)
+{
+	struct vclk *vclk;
+
+	vclk = cmucal_get_node(id);
+	if (!vclk || !vclk->name)
+		return false;
+
+	return !strcmp(vclk->name, "dvfs_cpucl1");
+}
+
 unsigned int cal_clk_is_enabled(unsigned int id)
 {
 	return 0;
@@ -50,14 +74,31 @@ unsigned long cal_dfs_get_max_freq(unsigned int id)
 {
 	struct vclk *vclk;
 	unsigned long highest_override;
+	bool is_gpu;
+	bool is_cpucl2;
+	bool is_cpucl1;
 
-	if (!cal_is_gpu_dvfs_id(id))
+	is_gpu = cal_is_gpu_dvfs_id(id);
+	is_cpucl2 = cal_is_cpucl2_dvfs_id(id);
+	is_cpucl1 = cal_is_cpucl1_dvfs_id(id);
+
+	if (!is_gpu && !is_cpucl2 && !is_cpucl1)
 		return vclk_get_max_freq(id);
 
-	if (!gpu_dvfs_has_overrides())
-		return vclk_get_max_freq(id);
+	if (is_gpu) {
+		if (!gpu_dvfs_has_overrides())
+			return vclk_get_max_freq(id);
+		highest_override = gpu_dvfs_override_highest_rate();
+	} else if (is_cpucl2) {
+		if (!cpucl2_dvfs_has_overrides())
+			return vclk_get_max_freq(id);
+		highest_override = cpucl2_dvfs_override_highest_rate();
+	} else {
+		if (!cpucl1_dvfs_has_overrides())
+			return vclk_get_max_freq(id);
+		highest_override = cpucl1_dvfs_override_highest_rate();
+	}
 
-	highest_override = gpu_dvfs_override_highest_rate();
 	vclk = cmucal_get_node(id);
 	if (vclk && vclk->lut && highest_override > vclk->max_freq)
 		vclk->max_freq = highest_override;
@@ -86,8 +127,10 @@ int cal_dfs_set_rate(unsigned int id, unsigned long rate)
 	int ret;
 	bool use_hiu = false;
 	bool force_vclk = false;
+	bool force_override = false;
 
-	force_vclk = IS_ACPM_VCLK(id) && cal_is_gpu_dvfs_id(id);
+	force_override = cal_is_gpu_dvfs_id(id); // || cal_is_cpucl2_dvfs_id(id);
+	force_vclk = IS_ACPM_VCLK(id) && force_override;
 
 	if (IS_ACPM_VCLK(id) && !force_vclk) {
 		use_hiu = cal_check_hiu_dvfs_id && cal_check_hiu_dvfs_id(id);
@@ -104,7 +147,7 @@ int cal_dfs_set_rate(unsigned int id, unsigned long rate)
 		}
 	} else {
 		ret = vclk_set_rate(id, rate);
-		if (cal_is_gpu_dvfs_id(id))
+		if (force_override)
 			ret = exynos_acpm_set_rate(GET_IDX(id), rate);
 	}
 
@@ -155,6 +198,10 @@ int cal_dfs_get_rate_table(unsigned int id, unsigned long *table)
     int ret;
     struct vclk *vclk;
     size_t override_idx;
+    size_t override_count = 0;
+    bool is_gpu;
+    bool is_cpucl2;
+    bool is_cpucl1;
 
     if (!table) {
         return -EINVAL;
@@ -162,7 +209,28 @@ int cal_dfs_get_rate_table(unsigned int id, unsigned long *table)
 
     ret = vclk_get_rate_table(id, table);
 
-    if (!cal_is_gpu_dvfs_id(id) || ret <= 0 || !gpu_dvfs_has_overrides())
+    is_gpu = cal_is_gpu_dvfs_id(id);
+    is_cpucl2 = cal_is_cpucl2_dvfs_id(id);
+    is_cpucl1 = cal_is_cpucl1_dvfs_id(id);
+
+    if ((!is_gpu && !is_cpucl2 && !is_cpucl1) || ret <= 0)
+        return ret;
+
+    if (is_gpu) {
+        if (!gpu_dvfs_has_overrides())
+            return ret;
+        override_count = gpu_dvfs_override_count();
+    } else if (is_cpucl2) {
+        if (!cpucl2_dvfs_has_overrides())
+            return ret;
+        override_count = cpucl2_dvfs_override_count();
+    } else {
+        if (!cpucl1_dvfs_has_overrides())
+            return ret;
+        override_count = cpucl1_dvfs_override_count();
+    }
+
+    if (!override_count)
         return ret;
 
     vclk = cmucal_get_node(id);
@@ -176,20 +244,38 @@ int cal_dfs_get_rate_table(unsigned int id, unsigned long *table)
     }
 
 
-    for (override_idx = 0; override_idx < gpu_dvfs_override_count(); override_idx++) {
-        const struct gpu_dvfs_override_entry *entry;
+    for (override_idx = 0; override_idx < override_count; override_idx++) {
+        unsigned long rate_khz;
         bool found = false;
         int insert_idx = vclk->num_rates;
         int idx;
 
-        entry = gpu_dvfs_override_get(override_idx);
-        if (!entry) {
-            continue;
+        if (is_gpu) {
+            const struct gpu_dvfs_override_entry *entry;
+
+            entry = gpu_dvfs_override_get(override_idx);
+            if (!entry)
+                continue;
+            rate_khz = entry->rate_khz;
+        } else if (is_cpucl2) {
+            const struct cpucl2_dvfs_override_entry *entry;
+
+            entry = cpucl2_dvfs_override_get(override_idx);
+            if (!entry)
+                continue;
+            rate_khz = entry->rate_khz;
+        } else {
+            const struct cpucl1_dvfs_override_entry *entry;
+
+            entry = cpucl1_dvfs_override_get(override_idx);
+            if (!entry)
+                continue;
+            rate_khz = entry->rate_khz;
         }
 
 
         for (idx = 0; idx < ret; idx++) {
-            if (table[idx] == entry->rate_khz) {
+            if (table[idx] == rate_khz) {
                 found = true;
                 break;
             }
@@ -199,11 +285,11 @@ int cal_dfs_get_rate_table(unsigned int id, unsigned long *table)
         }
 
         for (idx = 0; idx < vclk->num_rates; idx++) {
-            if (vclk->lut[idx].rate == entry->rate_khz) {
+            if (vclk->lut[idx].rate == rate_khz) {
                 insert_idx = idx;
                 break;
             }
-            if (insert_idx == vclk->num_rates && vclk->lut[idx].rate < entry->rate_khz)
+            if (insert_idx == vclk->num_rates && vclk->lut[idx].rate < rate_khz)
                 insert_idx = idx;
         }
 
@@ -217,7 +303,7 @@ int cal_dfs_get_rate_table(unsigned int id, unsigned long *table)
             ret++;
         }
 
-        table[insert_idx] = entry->rate_khz;
+        table[insert_idx] = rate_khz;
     }
 
     return ret;
@@ -442,14 +528,39 @@ int cal_dfs_get_asv_table(unsigned int id, unsigned int *table)
 	struct vclk *vclk;
 	size_t override_count = 0;
 	size_t override_idx;
-	struct gpu_override_plan {
-		const struct gpu_dvfs_override_entry *entry;
+	bool is_gpu;
+	bool is_cpucl2;
+	bool is_cpucl1;
+	struct dvfs_override_plan {
+		unsigned long rate_khz;
+		unsigned int volt_uv;
 		int index;
 	} *plans = NULL;
 
 	entries = fvmap_get_voltage_table(id, table);
 
-	if (!cal_is_gpu_dvfs_id(id) || entries <= 0 || !gpu_dvfs_has_overrides())
+	is_gpu = cal_is_gpu_dvfs_id(id);
+	is_cpucl2 = cal_is_cpucl2_dvfs_id(id);
+	is_cpucl1 = cal_is_cpucl1_dvfs_id(id);
+
+	if ((!is_gpu && !is_cpucl2 && !is_cpucl1) || entries <= 0)
+		return entries;
+
+	if (is_gpu) {
+		if (!gpu_dvfs_has_overrides())
+			return entries;
+		override_count = gpu_dvfs_override_count();
+	} else if (is_cpucl2) {
+		if (!cpucl2_dvfs_has_overrides())
+			return entries;
+		override_count = cpucl2_dvfs_override_count();
+	} else {
+		if (!cpucl1_dvfs_has_overrides())
+			return entries;
+		override_count = cpucl1_dvfs_override_count();
+	}
+
+	if (!override_count)
 		return entries;
 
 	vclk = cmucal_get_node(id);
@@ -459,23 +570,48 @@ int cal_dfs_get_asv_table(unsigned int id, unsigned int *table)
 	if (entries > vclk->num_rates)
 		entries = vclk->num_rates;
 
-	override_count = gpu_dvfs_override_count();
 	plans = kcalloc(override_count, sizeof(*plans), GFP_KERNEL);
     
 	if (!plans)
 		return entries;
 
 	for (override_idx = 0; override_idx < override_count; override_idx++) {
-		const struct gpu_dvfs_override_entry *entry;
+		unsigned long rate_khz;
+		unsigned int volt_uv;
 		int idx;
 
-		entry = gpu_dvfs_override_get(override_idx);
-		if (!entry)
-			continue;
+		plans[override_idx].index = -1;
+
+		if (is_gpu) {
+			const struct gpu_dvfs_override_entry *entry;
+
+			entry = gpu_dvfs_override_get(override_idx);
+			if (!entry)
+				continue;
+			rate_khz = entry->rate_khz;
+			volt_uv = entry->volt_uv;
+		} else if (is_cpucl2) {
+			const struct cpucl2_dvfs_override_entry *entry;
+
+			entry = cpucl2_dvfs_override_get(override_idx);
+			if (!entry)
+				continue;
+			rate_khz = entry->rate_khz;
+			volt_uv = entry->volt_uv;
+		} else {
+			const struct cpucl1_dvfs_override_entry *entry;
+
+			entry = cpucl1_dvfs_override_get(override_idx);
+			if (!entry)
+				continue;
+			rate_khz = entry->rate_khz;
+			volt_uv = entry->volt_uv;
+		}
 
 		for (idx = 0; idx < vclk->num_rates; idx++) {
-			if (vclk->lut[idx].rate == entry->rate_khz) {
-				plans[override_idx].entry = entry;
+			if (vclk->lut[idx].rate == rate_khz) {
+				plans[override_idx].rate_khz = rate_khz;
+				plans[override_idx].volt_uv = volt_uv;
 				plans[override_idx].index = idx;
 				break;
 			}
@@ -486,15 +622,15 @@ int cal_dfs_get_asv_table(unsigned int id, unsigned int *table)
 	for (override_idx = 0; override_idx < override_count; override_idx++) {
 		size_t other;
 
-		if (!plans[override_idx].entry)
+		if (plans[override_idx].index < 0)
 			continue;
 
 		for (other = override_idx + 1; other < override_count; other++) {
-			if (!plans[other].entry)
+			if (plans[other].index < 0)
 				continue;
 
 			if (plans[other].index > plans[override_idx].index) {
-				struct gpu_override_plan tmp = plans[override_idx];
+				struct dvfs_override_plan tmp = plans[override_idx];
 				plans[override_idx] = plans[other];
 				plans[other] = tmp;
 			}
@@ -502,11 +638,11 @@ int cal_dfs_get_asv_table(unsigned int id, unsigned int *table)
 	}
 
 	for (override_idx = 0; override_idx < override_count; override_idx++) {
-		const struct gpu_dvfs_override_entry *entry = plans[override_idx].entry;
+		unsigned int volt_uv = plans[override_idx].volt_uv;
 		int idx = plans[override_idx].index;
 		int shift;
 
-		if (!entry)
+		if (idx < 0)
 			continue;
 
 		if (idx > entries)
@@ -514,7 +650,7 @@ int cal_dfs_get_asv_table(unsigned int id, unsigned int *table)
 
 		if (idx >= entries) {
 			if (entries < vclk->num_rates) {
-				table[entries] = entry->volt_uv;
+				table[entries] = volt_uv;
 				entries++;
 			}
 			continue;
@@ -526,9 +662,9 @@ int cal_dfs_get_asv_table(unsigned int id, unsigned int *table)
 			entries++;
 		}
 
-		table[idx] = entry->volt_uv;
+		table[idx] = volt_uv;
 	}
-    
+
 	kfree(plans);
 
 	return entries;

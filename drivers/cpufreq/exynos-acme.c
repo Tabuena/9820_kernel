@@ -375,9 +375,11 @@ static int __exynos_cpufreq_target(struct cpufreq_policy *policy,
 		goto out;
 
 	if (domain->old != get_freq(domain)) {
+		unsigned int real = get_freq(domain);
+
 		pr_err("oops, inconsistency between domain->old:%d, real clk:%d\n",
-			domain->old, get_freq(domain));
-		BUG_ON(1);
+			domain->old, real);
+		domain->old = real;
 	}
 
 	/*
@@ -432,6 +434,7 @@ static int exynos_cpufreq_target(struct cpufreq_policy *policy,
 	int index;
 	unsigned int policy_min, policy_max;
 	unsigned int pm_qos_min, pm_qos_max;
+	bool force_cl2_lock;
 
 	if (!domain)
 		return -EINVAL;
@@ -439,9 +442,14 @@ static int exynos_cpufreq_target(struct cpufreq_policy *policy,
 	if (!domain->enabled)
 		return -EINVAL;
 
-	target_freq = apply_pm_qos(domain, policy, target_freq);
+	force_cl2_lock = (domain->id == 2 && policy->min == policy->max);
 
-	if (list_empty(&domain->dm_list))
+	if (!force_cl2_lock)
+		target_freq = apply_pm_qos(domain, policy, target_freq);
+	else
+		target_freq = policy->min;
+
+	if (force_cl2_lock || list_empty(&domain->dm_list))
 		return __exynos_cpufreq_target(policy, target_freq, relation);
 
 	index = cpufreq_frequency_table_target(policy, target_freq, relation);
@@ -673,6 +681,11 @@ static int exynos_cpufreq_pm_qos_callback(struct notifier_block *nb,
 	policy = cpufreq_cpu_get(cpumask_first(&mask));
 	if (!policy)
 		return NOTIFY_BAD;
+
+	if (domain->id == 2 && policy->min == policy->max) {
+		cpufreq_cpu_put(policy);
+		return NOTIFY_OK;
+	}
 
 	if (pm_qos_class == domain->pm_qos_max_class)
 		update_qos_capacity(cpumask_first(&domain->cpus), val, policy->cpuinfo.max_freq);
@@ -1389,7 +1402,7 @@ static int __init cpufreq_read_cpu_max_cl0(char *cpu_max_cl0)
 }
 __setup("cpu_max_cl0=", cpufreq_read_cpu_max_cl0);
 
-unsigned long arg_cpu_max_cl1 = 2504000;
+unsigned long arg_cpu_max_cl1 = 3000000;
 
 static int __init cpufreq_read_cpu_max_cl1(char *cpu_max_cl1)
 {
@@ -1406,7 +1419,7 @@ static int __init cpufreq_read_cpu_max_cl1(char *cpu_max_cl1)
 }
 __setup("cpu_max_cl1=", cpufreq_read_cpu_max_cl1);
 
-unsigned long arg_cpu_max_cl2 = 3500000;
+unsigned long arg_cpu_max_cl2 = 4000000;
 
 static int __init cpufreq_read_cpu_max_cl2(char *cpu_max_cl2)
 {

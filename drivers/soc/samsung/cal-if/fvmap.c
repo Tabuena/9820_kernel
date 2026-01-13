@@ -8,6 +8,8 @@
 #include <soc/samsung/cal-if.h>
 
 #include "cmucal.h"
+#include "cpucl1_dvfs_table.h"
+#include "cpucl2_dvfs_table.h"
 #include "fvmap.h"
 #include "g3d_dvfs_table.h"
 #include "ra.h"
@@ -31,6 +33,10 @@ static int volt_offset_percent = 0;
 static int percent_margin_table[MAX_MARGIN_ID];
 static struct vclk_lut *g3d_lut_override;
 static size_t g3d_lut_override_cap;
+static struct vclk_lut *cpucl1_lut_override;
+static size_t cpucl1_lut_override_cap;
+static struct vclk_lut *cpucl2_lut_override;
+static size_t cpucl2_lut_override_cap;
 
 #define G3D_MANUAL_RATE(_khz, _uv) {.rate = (_khz), .volt = (_uv)}
 
@@ -41,8 +47,23 @@ static const struct rate_volt g3d_manual_ratevolt[] = {
 };
 #undef G3D_MANUAL_ENTRY
 
-static size_t g3d_find_closest_lv(const struct rate_volt_header *old_rv,
-                                  size_t old_lv, unsigned int target_rate) {
+#define CPUCL2_MANUAL_ENTRY(rate_khz, volt_uv, pll_freq_hz, p, m, s, k) \
+	G3D_MANUAL_RATE(rate_khz, volt_uv),
+static const struct rate_volt cpucl2_manual_ratevolt[] = {
+	CPUCL2_DVFS_TABLE_ENTRY_LIST(CPUCL2_MANUAL_ENTRY)
+};
+#undef CPUCL2_MANUAL_ENTRY
+
+#define CPUCL1_MANUAL_ENTRY(rate_khz, volt_uv, pll_freq_hz, p, m, s, k) \
+	G3D_MANUAL_RATE(rate_khz, volt_uv),
+static const struct rate_volt cpucl1_manual_ratevolt[] = {
+	CPUCL1_DVFS_TABLE_ENTRY_LIST(CPUCL1_MANUAL_ENTRY)
+};
+#undef CPUCL1_MANUAL_ENTRY
+
+static size_t dvfs_find_closest_lv(const struct rate_volt_header *old_rv,
+                                   size_t old_lv,
+                                   unsigned int target_rate) {
     size_t best = 0;
     size_t j;
     u64 best_diff = ~0ULL;
@@ -60,8 +81,8 @@ static size_t g3d_find_closest_lv(const struct rate_volt_header *old_rv,
     return best;
 }
 
-static int g3d_pll_idx_for_rate(const struct vclk *vclk, size_t member_idx,
-                                unsigned int rate_khz) {
+static int dvfs_pll_idx_for_rate(const struct vclk *vclk, size_t member_idx,
+                                 unsigned int rate_khz) {
     struct cmucal_pll *pll;
     unsigned int clk_id;
     int idx;
@@ -85,30 +106,32 @@ static int g3d_pll_idx_for_rate(const struct vclk *vclk, size_t member_idx,
     return -ENOENT;
 }
 
-static int g3d_ensure_lut(struct vclk *vclk, size_t manual_lv) {
+static int dvfs_ensure_lut(struct vclk *vclk, size_t manual_lv,
+                           struct vclk_lut **lut_override,
+                           size_t *lut_override_cap) {
     size_t i;
 
 
     if (!vclk || !manual_lv || !vclk->num_list)
         return -EINVAL;
 
-    if (!g3d_lut_override || g3d_lut_override_cap < manual_lv) {
+    if (!*lut_override || *lut_override_cap < manual_lv) {
         struct vclk_lut *new_lut;
 
-        if (g3d_lut_override) {
-            for (i = 0; i < g3d_lut_override_cap; i++)
-                kfree(g3d_lut_override[i].params);
-            kfree(g3d_lut_override);
+        if (*lut_override) {
+            for (i = 0; i < *lut_override_cap; i++)
+                kfree((*lut_override)[i].params);
+            kfree(*lut_override);
         }
 
         new_lut = kcalloc(manual_lv, sizeof(*new_lut), GFP_KERNEL);
         if (!new_lut)
             return -ENOMEM;
 
-        g3d_lut_override = new_lut;
-        g3d_lut_override_cap = manual_lv;
+        *lut_override = new_lut;
+        *lut_override_cap = manual_lv;
 
-        for (i = 0; i < g3d_lut_override_cap; i++) {
+        for (i = 0; i < *lut_override_cap; i++) {
             new_lut[i].params =
                 kcalloc(vclk->num_list, sizeof(int), GFP_KERNEL);
             if (!new_lut[i].params)
@@ -117,18 +140,19 @@ static int g3d_ensure_lut(struct vclk *vclk, size_t manual_lv) {
         }
     }
 
-    for (i = 0; i < g3d_lut_override_cap; i++)
-        memset(g3d_lut_override[i].params, 0, sizeof(int) * vclk->num_list);
+    for (i = 0; i < *lut_override_cap; i++)
+        memset((*lut_override)[i].params, 0,
+               sizeof(int) * vclk->num_list);
 
-    vclk->lut = g3d_lut_override;
+    vclk->lut = *lut_override;
     return 0;
 
 err_alloc:
     while (i--)
-        kfree(g3d_lut_override[i].params);
-    kfree(g3d_lut_override);
-    g3d_lut_override = NULL;
-    g3d_lut_override_cap = 0;
+        kfree((*lut_override)[i].params);
+    kfree(*lut_override);
+    *lut_override = NULL;
+    *lut_override_cap = 0;
     return -ENOMEM;
 }
 
@@ -137,8 +161,9 @@ static int patch_tables(volatile struct fvmap_header *hdr,
                         const struct dvfs_table *old_param,
                         struct rate_volt_header *new_rv,
                         struct dvfs_table *new_param, struct vclk *vclk,
-                        size_t old_lv) {
-    size_t manual_lv = ARRAY_SIZE(g3d_manual_ratevolt);
+                        size_t old_lv, const struct rate_volt *manual_ratevolt,
+                        size_t manual_lv, struct vclk_lut **lut_override,
+                        size_t *lut_override_cap) {
     size_t members = hdr->num_of_members;
     size_t lv, k;
 
@@ -146,18 +171,18 @@ static int patch_tables(volatile struct fvmap_header *hdr,
     if (!vclk)
         return -EINVAL;
 
-    if (g3d_ensure_lut(vclk, manual_lv))
+    if (dvfs_ensure_lut(vclk, manual_lv, lut_override, lut_override_cap))
         return -ENOMEM;
 
     vclk->num_rates = manual_lv;
-    vclk->max_freq = g3d_manual_ratevolt[0].rate;
-    vclk->min_freq = g3d_manual_ratevolt[manual_lv - 1].rate;
+    vclk->max_freq = manual_ratevolt[0].rate;
+    vclk->min_freq = manual_ratevolt[manual_lv - 1].rate;
 
 
     for (lv = 0; lv < manual_lv; lv++) {
         size_t src_lv;
-        unsigned int rate = g3d_manual_ratevolt[lv].rate;
-        unsigned int volt = g3d_manual_ratevolt[lv].volt;
+        unsigned int rate = manual_ratevolt[lv].rate;
+        unsigned int volt = manual_ratevolt[lv].volt;
 
 
         new_rv->table[lv].rate = rate;
@@ -166,7 +191,7 @@ static int patch_tables(volatile struct fvmap_header *hdr,
         vclk->lut[lv].rate = rate;
 
         if (lv < old_lv)
-            src_lv = g3d_find_closest_lv(old_rv, old_lv, rate);
+            src_lv = dvfs_find_closest_lv(old_rv, old_lv, rate);
         else if (lv)
             src_lv = lv - 1;
         else
@@ -175,7 +200,7 @@ static int patch_tables(volatile struct fvmap_header *hdr,
 
         for (k = 0; k < members; k++) {
             unsigned int p;
-            int pll_param = g3d_pll_idx_for_rate(vclk, k, rate);
+            int pll_param = dvfs_pll_idx_for_rate(vclk, k, rate);
 
             if (pll_param >= 0) {
                 p = pll_param;
@@ -634,6 +659,10 @@ static void fvmap_copy_from_sram(void __iomem *map_base,
     int size, margin;
     int i, j, k;
     bool is_g3d;
+    bool is_cpucl1;
+    bool is_cpucl2;
+    bool use_cpucl1_manual = false;
+    bool use_cpucl2_manual = false;
     size_t old_lv;
 
 
@@ -669,10 +698,24 @@ static void fvmap_copy_from_sram(void __iomem *map_base,
 
         // expand listed size
         is_g3d = !strcmp(vclk->name, "dvfs_g3d");
+        is_cpucl1 = !strcmp(vclk->name, "dvfs_cpucl1");
+        is_cpucl2 = !strcmp(vclk->name, "dvfs_cpucl2");
         old_lv = fvmap_header[i].num_of_lv;
 
         if (is_g3d) {
             fvmap_header[i].num_of_lv = ARRAY_SIZE(g3d_manual_ratevolt);
+        } else if (is_cpucl1) {
+            use_cpucl1_manual = ARRAY_SIZE(cpucl1_manual_ratevolt) > 1 &&
+                                ARRAY_SIZE(cpucl1_manual_ratevolt) >= old_lv;
+            if (use_cpucl1_manual)
+                fvmap_header[i].num_of_lv =
+                    ARRAY_SIZE(cpucl1_manual_ratevolt);
+        } else if (is_cpucl2) {
+            use_cpucl2_manual = ARRAY_SIZE(cpucl2_manual_ratevolt) > 1 &&
+                                ARRAY_SIZE(cpucl2_manual_ratevolt) >= old_lv;
+            if (use_cpucl2_manual)
+                fvmap_header[i].num_of_lv =
+                    ARRAY_SIZE(cpucl2_manual_ratevolt);
         }
 
 
@@ -718,6 +761,18 @@ static void fvmap_copy_from_sram(void __iomem *map_base,
                 new->table[j].volt = g3d_manual_ratevolt[j].volt;
             }
 
+        } else if (is_cpucl1 && use_cpucl1_manual) {
+            for (j = 0; j < fvmap_header[i].num_of_lv; j++) {
+                new->table[j].rate = cpucl1_manual_ratevolt[j].rate;
+                new->table[j].volt = cpucl1_manual_ratevolt[j].volt;
+            }
+
+        } else if (is_cpucl2 && use_cpucl2_manual) {
+            for (j = 0; j < fvmap_header[i].num_of_lv; j++) {
+                new->table[j].rate = cpucl2_manual_ratevolt[j].rate;
+                new->table[j].volt = cpucl2_manual_ratevolt[j].volt;
+            }
+
         } else {
             for (j = 0; j < fvmap_header[i].num_of_lv; j++) {
                 new->table[j].rate = old->table[j].rate;
@@ -731,9 +786,36 @@ static void fvmap_copy_from_sram(void __iomem *map_base,
         // patch vclk
         if (!strcmp(vclk->name, "dvfs_g3d")) {
             int ret = patch_tables(&fvmap_header[i], old, old_param, new,
-                                   new_param, vclk, old_lv);
+                                   new_param, vclk, old_lv,
+                                   g3d_manual_ratevolt,
+                                   ARRAY_SIZE(g3d_manual_ratevolt),
+                                   &g3d_lut_override, &g3d_lut_override_cap);
             if (ret)
                 pr_err("G3D: manual override failed: %d\n", ret);
+            continue;
+        }
+
+        if (is_cpucl1 && use_cpucl1_manual) {
+            int ret = patch_tables(&fvmap_header[i], old, old_param, new,
+                                   new_param, vclk, old_lv,
+                                   cpucl1_manual_ratevolt,
+                                   ARRAY_SIZE(cpucl1_manual_ratevolt),
+                                   &cpucl1_lut_override,
+                                   &cpucl1_lut_override_cap);
+            if (ret)
+                pr_err("CPUCL1: manual override failed: %d\n", ret);
+            continue;
+        }
+
+        if (is_cpucl2 && use_cpucl2_manual) {
+            int ret = patch_tables(&fvmap_header[i], old, old_param, new,
+                                   new_param, vclk, old_lv,
+                                   cpucl2_manual_ratevolt,
+                                   ARRAY_SIZE(cpucl2_manual_ratevolt),
+                                   &cpucl2_lut_override,
+                                   &cpucl2_lut_override_cap);
+            if (ret)
+                pr_err("CPUCL2: manual override failed: %d\n", ret);
             continue;
         }
 

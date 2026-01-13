@@ -14,6 +14,8 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
+#include "cal-if/cpucl1_dvfs_overrides.h"
+#include "cal-if/cpucl2_dvfs_overrides.h"
 #include "cal-if/g3d_dvfs_table.h"
 
 #define ALIGNMENT_SIZE 4
@@ -54,6 +56,55 @@ static const struct ect_pll_frequency g3d_pll_freqs[] = {
 	G3D_DVFS_TABLE_ENTRY_LIST(G3D_PLL_ENTRY)
 };
 #undef G3D_PLL_ENTRY
+
+#define CPUCL1_FREQ_KHZ_ENTRY(rate_khz, volt_uv, pll_freq_hz, p, m, s, k) \
+	rate_khz,
+static const u32 cpucl1_freqs_khz[] = {
+	CPUCL1_DVFS_TABLE_ENTRY_LIST(CPUCL1_FREQ_KHZ_ENTRY)
+};
+#undef CPUCL1_FREQ_KHZ_ENTRY
+
+#define CPUCL1_FREQ_MHZ_ENTRY(rate_khz, volt_uv, pll_freq_hz, p, m, s, k) \
+	((rate_khz) / 1000),
+static const int32_t cpucl1_freqs_mhz[] = {
+	CPUCL1_DVFS_TABLE_ENTRY_LIST(CPUCL1_FREQ_MHZ_ENTRY)
+};
+#undef CPUCL1_FREQ_MHZ_ENTRY
+
+#define CPUCL1_PLL_ENTRY(rate_khz, volt_uv, pll_freq_hz, p, m, s, k) \
+	{ (pll_freq_hz), (p), (m), (s), (k) },
+static const struct ect_pll_frequency cpucl1_pll_freqs[] = {
+	CPUCL1_DVFS_TABLE_ENTRY_LIST(CPUCL1_PLL_ENTRY)
+};
+#undef CPUCL1_PLL_ENTRY
+
+#define CPUCL2_FREQ_KHZ_ENTRY(rate_khz, volt_uv, pll_freq_hz, p, m, s, k) \
+	rate_khz,
+static const u32 cpucl2_freqs_khz[] = {
+	CPUCL2_DVFS_TABLE_ENTRY_LIST(CPUCL2_FREQ_KHZ_ENTRY)
+};
+#undef CPUCL2_FREQ_KHZ_ENTRY
+
+static const u32 cpucl2_dvfs_value_clk1[] = {
+	1, 1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1, 1,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+};
+
+#define CPUCL2_FREQ_MHZ_ENTRY(rate_khz, volt_uv, pll_freq_hz, p, m, s, k) \
+	((rate_khz) / 1000),
+static const int32_t cpucl2_freqs_mhz[] = {
+	CPUCL2_DVFS_TABLE_ENTRY_LIST(CPUCL2_FREQ_MHZ_ENTRY)
+};
+#undef CPUCL2_FREQ_MHZ_ENTRY
+
+#define CPUCL2_PLL_ENTRY(rate_khz, volt_uv, pll_freq_hz, p, m, s, k) \
+	{ (pll_freq_hz), (p), (m), (s), (k) },
+static const struct ect_pll_frequency cpucl2_pll_freqs[] = {
+	CPUCL2_DVFS_TABLE_ENTRY_LIST(CPUCL2_PLL_ENTRY)
+};
+#undef CPUCL2_PLL_ENTRY
 
 /* API for internal */
 
@@ -2665,9 +2716,9 @@ static int ect_override_g3d_tables(void) {
             if (!new_map)
                 return -ENOMEM;
 
-            for (c = 0; c < clocks; c++) {
-                for (i = 0; i < new_levels; i++)
-                    new_map[c * new_levels + i] = (u32)i;
+            for (i = 0; i < new_levels; i++) {
+                for (c = 0; c < clocks; c++)
+                    new_map[i * clocks + c] = (u32)i;
             }
 
             dvfs->list_dvfs_value = new_map;
@@ -2823,6 +2874,352 @@ static int ect_override_g3d_tables(void) {
     return 0;
 }
 
+static int ect_override_cpucl2_tables(void) {
+    void *dvfs_blk, *asv_blk;
+    struct ect_dvfs_domain *dvfs;
+    struct ect_voltage_domain *asv;
+
+    int old_levels;
+
+    const int new_levels = ARRAY_SIZE(cpucl2_freqs_khz);
+
+    if (new_levels <= 1)
+        return 0;
+
+    /* --- DVFS domain holen --- */
+    dvfs_blk = ect_get_block(BLOCK_DVFS);
+    if (!dvfs_blk)
+        return -ENODEV;
+
+    dvfs = ect_dvfs_get_domain(dvfs_blk, "dvfs_cpucl2");
+    if (!dvfs)
+        return -ENODEV;
+
+    old_levels = dvfs->num_of_level;
+
+    if (old_levels < new_levels) {
+        /* list_level neu */
+        {
+            void *new_list_level;
+            u32 *p;
+            int i;
+            const size_t stride_u32 =
+                sizeof(struct ect_dvfs_level) / sizeof(u32);
+
+            new_list_level =
+                kzalloc(sizeof(struct ect_dvfs_level) * new_levels, GFP_KERNEL);
+            if (!new_list_level)
+                return -ENOMEM;
+
+            p = (u32 *)new_list_level;
+
+            for (i = 0; i < new_levels; i++) {
+                p[i * stride_u32 + 0] = cpucl2_freqs_khz[i]; /* freq kHz */
+                p[i * stride_u32 + 1] = 1;                  /* enable */
+            }
+
+            dvfs->list_level = new_list_level;
+        }
+
+        /* list_dvfs_value neu (Index-Mapping pro Clock) */
+        {
+            u32 *new_map;
+            int c, i;
+            const int clocks = dvfs->num_of_clock;
+
+            new_map = kzalloc(sizeof(u32) * clocks * new_levels, GFP_KERNEL);
+            if (!new_map)
+                return -ENOMEM;
+
+            for (i = 0; i < new_levels; i++) {
+                for (c = 0; c < clocks; c++) {
+                    u32 val = (u32)i;
+
+                    if (c == 1 && i < ARRAY_SIZE(cpucl2_dvfs_value_clk1))
+                        val = cpucl2_dvfs_value_clk1[i];
+
+                    new_map[i * clocks + c] = val;
+                }
+            }
+
+            dvfs->list_dvfs_value = new_map;
+        }
+
+        dvfs->num_of_level = new_levels;
+        dvfs->max_frequency = cpucl2_freqs_khz[0];
+        dvfs->min_frequency = cpucl2_freqs_khz[new_levels - 1];
+    }
+
+    /* --- ASV domain holen --- */
+    asv_blk = ect_get_block(BLOCK_ASV);
+    if (!asv_blk)
+        return -ENODEV;
+
+    asv = ect_asv_get_domain(asv_blk, "dvfs_cpucl2");
+    if (!asv)
+        return -ENODEV;
+
+    old_levels = asv->num_of_level;
+
+    if (old_levels < new_levels) {
+        const int delta = new_levels - old_levels;
+        const int g = asv->num_of_group;
+        int t;
+
+        /* 1) level_list (MHz) neu */
+        {
+            int32_t *new_level_list;
+
+            new_level_list = kzalloc(sizeof(int32_t) * new_levels, GFP_KERNEL);
+            if (!new_level_list)
+                return -ENOMEM;
+
+            memcpy(new_level_list, cpucl2_freqs_mhz,
+                   sizeof(cpucl2_freqs_mhz));
+            asv->level_list = new_level_list;
+        }
+
+        /* 2) jede TABLE VERSION aufblasen:
+              neue Top-Rows = Kopie der alten Top-Row (konservativ)
+              alte Rows werden um delta nach unten geschoben */
+        for (t = 0; t < asv->num_of_table; t++) {
+            struct ect_voltage_table *tbl = &asv->table_list[t];
+
+            /* level_en erweitern (wenn vorhanden) */
+            if (tbl->level_en) {
+                int32_t *old_en = (int32_t *)tbl->level_en;
+                int32_t *new_en =
+                    kzalloc(sizeof(int32_t) * new_levels, GFP_KERNEL);
+                int r;
+
+                if (!new_en)
+                    return -ENOMEM;
+
+                for (r = 0; r < delta; r++)
+                    new_en[r] = old_en[0];
+
+                memcpy(&new_en[delta], old_en, sizeof(int32_t) * old_levels);
+                tbl->level_en = new_en;
+            }
+
+            /* parser_version>=3: voltages_step (u8) */
+            if (tbl->voltages_step) {
+                u8 *old = (u8 *)tbl->voltages_step;
+                u8 *neu = kzalloc(sizeof(u8) * g * new_levels, GFP_KERNEL);
+                int r;
+
+                if (!neu)
+                    return -ENOMEM;
+
+                /* neue Top-Rows (0..delta-1) = alte Row0 */
+                for (r = 0; r < delta; r++)
+                    memcpy(&neu[g * r], &old[0], g * sizeof(u8));
+
+                /* alte Rows nach unten schieben */
+                memcpy(&neu[g * delta], &old[0], g * old_levels * sizeof(u8));
+
+                tbl->voltages_step = neu;
+            }
+            /* parser_version<3: voltages (int32 uV) */
+            else if (tbl->voltages) {
+                int32_t *old = (int32_t *)tbl->voltages;
+                int32_t *neu =
+                    kzalloc(sizeof(int32_t) * g * new_levels, GFP_KERNEL);
+                int r;
+
+                if (!neu)
+                    return -ENOMEM;
+
+                for (r = 0; r < delta; r++)
+                    memcpy(&neu[g * r], &old[0], g * sizeof(int32_t));
+
+                memcpy(&neu[g * delta], &old[0],
+                       g * old_levels * sizeof(int32_t));
+
+                tbl->voltages = neu;
+            } else {
+                pr_warn(
+                    "[ECT] cpucl2 override: ASV table %d has no voltage data\n",
+                    t);
+            }
+        }
+
+        asv->num_of_level = new_levels;
+    }
+
+    return 0;
+}
+
+static int ect_override_cpucl1_tables(void) {
+    void *dvfs_blk, *asv_blk;
+    struct ect_dvfs_domain *dvfs;
+    struct ect_voltage_domain *asv;
+
+    int old_levels;
+
+    const int new_levels = ARRAY_SIZE(cpucl1_freqs_khz);
+
+    if (new_levels <= 1)
+        return 0;
+
+    /* --- DVFS domain holen --- */
+    dvfs_blk = ect_get_block(BLOCK_DVFS);
+    if (!dvfs_blk)
+        return -ENODEV;
+
+    dvfs = ect_dvfs_get_domain(dvfs_blk, "dvfs_cpucl1");
+    if (!dvfs)
+        return -ENODEV;
+
+    old_levels = dvfs->num_of_level;
+
+    if (old_levels < new_levels) {
+        /* list_level neu */
+        {
+            void *new_list_level;
+            u32 *p;
+            int i;
+            const size_t stride_u32 =
+                sizeof(struct ect_dvfs_level) / sizeof(u32);
+
+            new_list_level =
+                kzalloc(sizeof(struct ect_dvfs_level) * new_levels, GFP_KERNEL);
+            if (!new_list_level)
+                return -ENOMEM;
+
+            p = (u32 *)new_list_level;
+
+            for (i = 0; i < new_levels; i++) {
+                p[i * stride_u32 + 0] = cpucl1_freqs_khz[i]; /* freq kHz */
+                p[i * stride_u32 + 1] = 1;                  /* enable */
+            }
+
+            dvfs->list_level = new_list_level;
+        }
+
+        /* list_dvfs_value neu (Index-Mapping pro Clock) */
+        {
+            u32 *new_map;
+            int c, i;
+            const int clocks = dvfs->num_of_clock;
+
+            new_map = kzalloc(sizeof(u32) * clocks * new_levels, GFP_KERNEL);
+            if (!new_map)
+                return -ENOMEM;
+
+            for (i = 0; i < new_levels; i++) {
+                for (c = 0; c < clocks; c++)
+                    new_map[i * clocks + c] = (u32)i;
+            }
+
+            dvfs->list_dvfs_value = new_map;
+        }
+
+        dvfs->num_of_level = new_levels;
+        dvfs->max_frequency = cpucl1_freqs_khz[0];
+        dvfs->min_frequency = cpucl1_freqs_khz[new_levels - 1];
+    }
+
+    /* --- ASV domain holen --- */
+    asv_blk = ect_get_block(BLOCK_ASV);
+    if (!asv_blk)
+        return -ENODEV;
+
+    asv = ect_asv_get_domain(asv_blk, "dvfs_cpucl1");
+    if (!asv)
+        return -ENODEV;
+
+    old_levels = asv->num_of_level;
+
+    if (old_levels < new_levels) {
+        const int delta = new_levels - old_levels;
+        const int g = asv->num_of_group;
+        int t;
+
+        /* 1) level_list (MHz) neu */
+        {
+            int32_t *new_level_list;
+
+            new_level_list = kzalloc(sizeof(int32_t) * new_levels, GFP_KERNEL);
+            if (!new_level_list)
+                return -ENOMEM;
+
+            memcpy(new_level_list, cpucl1_freqs_mhz,
+                   sizeof(cpucl1_freqs_mhz));
+            asv->level_list = new_level_list;
+        }
+
+        /* 2) jede TABLE VERSION aufblasen:
+              neue Top-Rows = Kopie der alten Top-Row (konservativ)
+              alte Rows werden um delta nach unten geschoben */
+        for (t = 0; t < asv->num_of_table; t++) {
+            struct ect_voltage_table *tbl = &asv->table_list[t];
+
+            /* level_en erweitern (wenn vorhanden) */
+            if (tbl->level_en) {
+                int32_t *old_en = (int32_t *)tbl->level_en;
+                int32_t *new_en =
+                    kzalloc(sizeof(int32_t) * new_levels, GFP_KERNEL);
+                int r;
+
+                if (!new_en)
+                    return -ENOMEM;
+
+                for (r = 0; r < delta; r++)
+                    new_en[r] = old_en[0];
+
+                memcpy(&new_en[delta], old_en, sizeof(int32_t) * old_levels);
+                tbl->level_en = new_en;
+            }
+
+            /* parser_version>=3: voltages_step (u8) */
+            if (tbl->voltages_step) {
+                u8 *old = (u8 *)tbl->voltages_step;
+                u8 *neu = kzalloc(sizeof(u8) * g * new_levels, GFP_KERNEL);
+                int r;
+
+                if (!neu)
+                    return -ENOMEM;
+
+                /* neue Top-Rows (0..delta-1) = alte Row0 */
+                for (r = 0; r < delta; r++)
+                    memcpy(&neu[g * r], &old[0], g * sizeof(u8));
+
+                /* alte Rows nach unten schieben */
+                memcpy(&neu[g * delta], &old[0], g * old_levels * sizeof(u8));
+
+                tbl->voltages_step = neu;
+            }
+            /* parser_version<3: voltages (int32 uV) */
+            else if (tbl->voltages) {
+                int32_t *old = (int32_t *)tbl->voltages;
+                int32_t *neu =
+                    kzalloc(sizeof(int32_t) * g * new_levels, GFP_KERNEL);
+                int r;
+
+                if (!neu)
+                    return -ENOMEM;
+
+                for (r = 0; r < delta; r++)
+                    memcpy(&neu[g * r], &old[0], g * sizeof(int32_t));
+
+                memcpy(&neu[g * delta], &old[0],
+                       g * old_levels * sizeof(int32_t));
+
+                tbl->voltages = neu;
+            } else {
+                pr_warn(
+                    "[ECT] cpucl1 override: ASV table %d has no voltage data\n",
+                    t);
+            }
+        }
+
+        asv->num_of_level = new_levels;
+    }
+
+    return 0;
+}
+
 static int ect_override_g3d_pll_table(void) {
     void *pll_blk;
     struct ect_pll *pll;
@@ -2856,6 +3253,121 @@ static int ect_override_g3d_pll_table(void) {
     return 0;
 }
 
+static int ect_override_cpucl2_pll_table(void) {
+    void *pll_blk;
+    struct ect_pll *pll;
+    struct ect_pll_frequency *new_list;
+
+    static struct ect_pll_frequency *override_list;
+
+    if (ARRAY_SIZE(cpucl2_pll_freqs) <= 1)
+        return 0;
+
+    pll_blk = ect_get_block(BLOCK_PLL);
+    if (!pll_blk)
+        return -ENODEV;
+
+    pll = ect_pll_get_pll(pll_blk, "PLL_CPUCL2");
+    if (!pll)
+        return -ENODEV;
+
+    if (pll->num_of_frequency == ARRAY_SIZE(cpucl2_pll_freqs) &&
+        pll->frequency_list &&
+        !memcmp(pll->frequency_list, cpucl2_pll_freqs,
+                sizeof(cpucl2_pll_freqs))) {
+        return 0;
+    }
+
+    new_list = kmemdup(cpucl2_pll_freqs, sizeof(cpucl2_pll_freqs), GFP_KERNEL);
+    if (!new_list)
+        return -ENOMEM;
+
+    kfree(override_list);
+    override_list = new_list;
+
+    pll->frequency_list = override_list;
+    pll->num_of_frequency = ARRAY_SIZE(cpucl2_pll_freqs);
+
+    return 0;
+}
+
+static int ect_override_cpucl1_pll_table(void) {
+    void *pll_blk;
+    struct ect_pll *pll;
+    struct ect_pll_frequency *new_list;
+
+    static struct ect_pll_frequency *override_list;
+
+    if (ARRAY_SIZE(cpucl1_pll_freqs) <= 1)
+        return 0;
+
+    pll_blk = ect_get_block(BLOCK_PLL);
+    if (!pll_blk)
+        return -ENODEV;
+
+    pll = ect_pll_get_pll(pll_blk, "PLL_CPUCL1");
+    if (!pll)
+        return -ENODEV;
+
+    if (pll->num_of_frequency == ARRAY_SIZE(cpucl1_pll_freqs) &&
+        pll->frequency_list &&
+        !memcmp(pll->frequency_list, cpucl1_pll_freqs,
+                sizeof(cpucl1_pll_freqs))) {
+        return 0;
+    }
+
+    new_list = kmemdup(cpucl1_pll_freqs, sizeof(cpucl1_pll_freqs), GFP_KERNEL);
+    if (!new_list)
+        return -ENOMEM;
+
+    kfree(override_list);
+    override_list = new_list;
+
+    pll->frequency_list = override_list;
+    pll->num_of_frequency = ARRAY_SIZE(cpucl1_pll_freqs);
+
+    return 0;
+}
+
+static int ect_override_minlock_cpucl2_tables(void) {
+    void *minlock_blk;
+    struct ect_minlock_domain *domain;
+    struct ect_minlock_frequency *new_list;
+
+    static struct ect_minlock_frequency *override_list;
+
+    if (!ARRAY_SIZE(cpucl2_minlock_levels))
+        return 0;
+
+    minlock_blk = ect_get_block(BLOCK_MINLOCK);
+    if (!minlock_blk)
+        return -ENODEV;
+
+    domain = ect_minlock_get_domain(minlock_blk, "dvfs_cpucl2");
+    if (!domain)
+        return -ENODEV;
+
+    if (domain->num_of_level == ARRAY_SIZE(cpucl2_minlock_levels) &&
+        domain->level &&
+        !memcmp(domain->level, cpucl2_minlock_levels,
+                sizeof(cpucl2_minlock_levels))) {
+        return 0;
+    }
+
+    new_list = kmemdup(cpucl2_minlock_levels,
+                       sizeof(cpucl2_minlock_levels), GFP_KERNEL);
+    if (!new_list)
+        return -ENOMEM;
+
+    kfree(override_list);
+    override_list = new_list;
+
+    domain->level = override_list;
+    domain->num_of_level = ARRAY_SIZE(cpucl2_minlock_levels);
+
+    return 0;
+}
+
 static int ect_override_minmax_dvfs_g3d_maxfreq(u32 new_max_khz)
 {
     void *gen_blk;
@@ -2884,6 +3396,116 @@ static int ect_override_minmax_dvfs_g3d_maxfreq(u32 new_max_khz)
 
     if (rows <= 0 || rows > 1024 || cols <= MINMAX_MAX_FREQ || cols > 64) {
         pr_err("[ECT] minmax override: suspicious shape rows=%d cols=%d\n", rows, cols);
+        return -EINVAL;
+    }
+
+    oldp = (u32 *)minmax->parameter;
+
+    /* clone current table */
+    override_minmax_bytes = (size_t)rows * (size_t)cols * sizeof(u32);
+    newp = kmemdup(oldp, override_minmax_bytes, GFP_KERNEL);
+    if (!newp)
+        return -ENOMEM;
+
+    /* replace previous override buffer */
+    kfree(override_minmax);
+    override_minmax = newp;
+
+    /* Force MAX freq column for every row */
+    for (i = 0; i < rows; i++) {
+        u32 *rowp = &override_minmax[i * cols];
+        rowp[MINMAX_MAX_FREQ] = new_max_khz;
+    }
+
+    minmax->parameter = override_minmax;
+
+    return 0;
+}
+
+static int ect_override_minmax_dvfs_cpucl2_maxfreq(u32 new_max_khz)
+{
+    void *gen_blk;
+    struct ect_gen_param_table *minmax;
+    u32 *oldp, *newp;
+    int rows, cols, i;
+
+    /* Keep allocated override alive */
+    static u32 *override_minmax;
+    static size_t override_minmax_bytes;
+
+    gen_blk = ect_get_block(BLOCK_GEN_PARAM);
+    if (!gen_blk) {
+        pr_warn("[ECT] minmax override: GEN_PARAM block missing\n");
+        return -ENODEV;
+    }
+
+    minmax = ect_gen_param_get_table(gen_blk, "MINMAX_dvfs_cpucl2");
+    if (!minmax || !minmax->parameter) {
+        pr_warn("[ECT] minmax override: table MINMAX_dvfs_cpucl2 missing\n");
+        return -ENODEV;
+    }
+
+    rows = minmax->num_of_row;
+    cols = minmax->num_of_col;
+
+    if (rows <= 0 || rows > 1024 || cols <= MINMAX_MAX_FREQ || cols > 64) {
+        pr_err("[ECT] minmax override: suspicious shape rows=%d cols=%d\n",
+               rows, cols);
+        return -EINVAL;
+    }
+
+    oldp = (u32 *)minmax->parameter;
+
+    /* clone current table */
+    override_minmax_bytes = (size_t)rows * (size_t)cols * sizeof(u32);
+    newp = kmemdup(oldp, override_minmax_bytes, GFP_KERNEL);
+    if (!newp)
+        return -ENOMEM;
+
+    /* replace previous override buffer */
+    kfree(override_minmax);
+    override_minmax = newp;
+
+    /* Force MAX freq column for every row */
+    for (i = 0; i < rows; i++) {
+        u32 *rowp = &override_minmax[i * cols];
+        rowp[MINMAX_MAX_FREQ] = new_max_khz;
+    }
+
+    minmax->parameter = override_minmax;
+
+    return 0;
+}
+
+static int ect_override_minmax_dvfs_cpucl1_maxfreq(u32 new_max_khz)
+{
+    void *gen_blk;
+    struct ect_gen_param_table *minmax;
+    u32 *oldp, *newp;
+    int rows, cols, i;
+
+    /* Keep allocated override alive */
+    static u32 *override_minmax;
+    static size_t override_minmax_bytes;
+
+    gen_blk = ect_get_block(BLOCK_GEN_PARAM);
+    if (!gen_blk) {
+        pr_warn("[ECT] minmax override: GEN_PARAM block missing\n");
+        return -ENODEV;
+    }
+
+    minmax = ect_gen_param_get_table(gen_blk, "MINMAX_dvfs_cpucl1");
+    if (!minmax || !minmax->parameter) {
+        pr_warn("[ECT] minmax override: table MINMAX_dvfs_cpucl1 missing\n");
+        return -ENODEV;
+    }
+
+    rows = minmax->num_of_row;
+    cols = minmax->num_of_col;
+
+    if (rows <= 0 || rows > 1024 || cols <= MINMAX_MAX_FREQ || cols > 64) {
+        pr_err("[ECT] minmax override: suspicious shape rows=%d cols=%d\n",
+               rows, cols);
         return -EINVAL;
     }
 
@@ -2965,6 +3587,13 @@ int ect_parse_binary_header(void) {
     ect_override_g3d_tables();
     ect_override_g3d_pll_table();
     ect_override_minmax_dvfs_g3d_maxfreq(g3d_freqs_khz[0]);
+    ect_override_cpucl1_tables();
+    ect_override_cpucl1_pll_table();
+    ect_override_minmax_dvfs_cpucl1_maxfreq(cpucl1_freqs_khz[0]);
+    ect_override_cpucl2_tables();
+    ect_override_cpucl2_pll_table();
+    ect_override_minlock_cpucl2_tables();
+    ect_override_minmax_dvfs_cpucl2_maxfreq(cpucl2_freqs_khz[0]);
 
     ect_header_info.block_handle = ect_header;
 

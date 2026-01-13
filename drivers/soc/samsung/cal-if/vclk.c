@@ -8,6 +8,8 @@
 #include "acpm_dvfs.h"
 #include "asv.h"
 #include "cmucal.h"
+#include "cpucl1_dvfs_overrides.h"
+#include "cpucl2_dvfs_overrides.h"
 #include "gpu_dvfs_overrides.h"
 #include "ra.h"
 #include "vclk.h"
@@ -535,6 +537,8 @@ static int vclk_get_dfs_info(struct vclk *vclk) {
     unsigned long highest_override = 0;
     size_t override_count = 0;
     bool is_gpu = false;
+    bool is_cpucl2 = false;
+    bool is_cpucl1 = false;
     bool descending = false;
     int current_num_rates;
     int ret = 0;
@@ -583,13 +587,23 @@ static int vclk_get_dfs_info(struct vclk *vclk) {
     original_num_rates = vclk->num_rates;
     alloc_num_rates = original_num_rates;
     is_gpu = !strcmp(vclk->name, "dvfs_g3d");
+    is_cpucl2 = !strcmp(vclk->name, "dvfs_cpucl2");
+    is_cpucl1 = !strcmp(vclk->name, "dvfs_cpucl1");
 
 
     if (is_gpu && gpu_dvfs_has_overrides()) {
         override_count = gpu_dvfs_override_count();
         if (override_count)
             alloc_num_rates += override_count;
-    } else if (is_gpu) {
+    } else if (is_cpucl2 && cpucl2_dvfs_has_overrides()) {
+        override_count = cpucl2_dvfs_override_count();
+        if (override_count)
+            alloc_num_rates += override_count;
+    } else if (is_cpucl1 && cpucl1_dvfs_has_overrides()) {
+        override_count = cpucl1_dvfs_override_count();
+        if (override_count)
+            alloc_num_rates += override_count;
+    } else if (is_gpu || is_cpucl2 || is_cpucl1) {
     }
 
     if (minmax_table != NULL) {
@@ -673,38 +687,57 @@ static int vclk_get_dfs_info(struct vclk *vclk) {
         descending = vclk->lut[1].rate < vclk->lut[0].rate;
 
 
-    /* GPU override insertion */
-    if (is_gpu && override_count) {
+    /* Override insertion */
+    if ((is_gpu || is_cpucl2 || is_cpucl1) && override_count) {
         size_t override_idx;
 
 
         for (override_idx = 0; override_idx < override_count; override_idx++) {
-            const struct gpu_dvfs_override_entry *entry;
+            unsigned long rate_khz;
             unsigned int *override_params;
             int insert_idx = current_num_rates;
             int template_idx;
             bool found = false;
 
-            entry = gpu_dvfs_override_get(override_idx);
-            if (!entry)
-                continue;
+            if (is_gpu) {
+                const struct gpu_dvfs_override_entry *entry;
+
+                entry = gpu_dvfs_override_get(override_idx);
+                if (!entry)
+                    continue;
+                rate_khz = entry->rate_khz;
+            } else if (is_cpucl2) {
+                const struct cpucl2_dvfs_override_entry *entry;
+
+                entry = cpucl2_dvfs_override_get(override_idx);
+                if (!entry)
+                    continue;
+                rate_khz = entry->rate_khz;
+            } else {
+                const struct cpucl1_dvfs_override_entry *entry;
+
+                entry = cpucl1_dvfs_override_get(override_idx);
+                if (!entry)
+                    continue;
+                rate_khz = entry->rate_khz;
+            }
 
 
-            highest_override = max(highest_override, entry->rate_khz);
+            highest_override = max(highest_override, rate_khz);
 
             /* Find duplicate or insertion position */
             for (i = 0; i < current_num_rates; i++) {
-                if (vclk->lut[i].rate == entry->rate_khz) {
+                if (vclk->lut[i].rate == rate_khz) {
                     found = true;
                     break;
                 }
 
                 if (descending) {
-                    if (entry->rate_khz > vclk->lut[i].rate &&
+                    if (rate_khz > vclk->lut[i].rate &&
                         insert_idx == current_num_rates)
                         insert_idx = i;
                 } else {
-                    if (entry->rate_khz < vclk->lut[i].rate &&
+                    if (rate_khz < vclk->lut[i].rate &&
                         insert_idx == current_num_rates)
                         insert_idx = i;
                 }
@@ -740,7 +773,7 @@ static int vclk_get_dfs_info(struct vclk *vclk) {
             for (k = 0; k < vclk->num_list; k++) {
                 if (IS_PLL(vclk->list[k])) {
                     int pll_idx =
-                        vclk_pll_idx_for_rate(vclk, k, entry->rate_khz);
+                        vclk_pll_idx_for_rate(vclk, k, rate_khz);
 
                     if (pll_idx >= 0) {
                         override_params[k] = pll_idx;
@@ -753,7 +786,7 @@ static int vclk_get_dfs_info(struct vclk *vclk) {
             for (k = current_num_rates; k > insert_idx; k--)
                 vclk->lut[k] = vclk->lut[k - 1];
 
-            vclk->lut[insert_idx].rate = entry->rate_khz;
+            vclk->lut[insert_idx].rate = rate_khz;
             vclk->lut[insert_idx].params = override_params;
             current_num_rates++;
 

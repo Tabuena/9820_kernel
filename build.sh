@@ -290,10 +290,6 @@ if [ -n "$GPU_MAX" ]; then
         echo "Invalid GPU max value: $GPU_MAX"
         exit 1
     fi
-
-    if [ "$SOC" != "exynos9820" ]; then
-        echo "GPU max override is only supported on exynos9820; skipping."
-    else
         if [ "$GPU_MAX" -lt 10000 ]; then
             GPU_MAX_KHZ=$((GPU_MAX * 1000))
         else
@@ -301,7 +297,6 @@ if [ -n "$GPU_MAX" ]; then
         fi
         echo "Applying GPU max: ${GPU_MAX_KHZ} kHz (from forOC tables)"
         apply_gpu_tables "$GPU_MAX_KHZ" || abort
-    fi
 fi
 
 rm -rf build/out/$MODEL

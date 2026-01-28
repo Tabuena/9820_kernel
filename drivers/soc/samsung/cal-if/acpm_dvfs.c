@@ -41,7 +41,6 @@ int exynos_acpm_set_rate(unsigned int id, unsigned long rate)
 	ret = acpm_ipc_send_data_lazy(acpm_dvfs.ch_num, &config);
 	after = sched_clock();
 	latency = after - before;
-
 	if (ret)
 		pr_err("%s:[%d] latency = %llu ret = %d",
 			__func__, id, latency, ret);
@@ -70,7 +69,6 @@ int exynos_acpm_set_init_freq(unsigned int dfs_id, unsigned long freq)
 	ret = acpm_ipc_send_data_lazy(acpm_dvfs.ch_num, &config);
 	after = sched_clock();
 	latency = after - before;
-
 	if (ret)
 		pr_err("%s:[%d] latency = %llu ret = %d",
 			__func__, id, latency, ret);
@@ -169,6 +167,7 @@ int exynos_acpm_set_cold_temp(unsigned int id, bool is_cold_temp)
 
 static void acpm_noti_mif_callback(unsigned int *cmd, unsigned int size)
 {
+	pr_info("%s : req %d KHz\n", __func__, cmd[1]);
 	pm_qos_update_request(&mif_request_from_acpm, cmd[1]);
 }
 
@@ -247,18 +246,19 @@ static void acpm_dvfs_get_cpu_cold_temp_list(struct device *dev)
 #ifndef CONFIG_EXYNOS_ACPM_THERMAL
 static void acpm_dvfs_get_gpu_cold_temp_list(struct device *dev)
 {
-    struct device_node *node = dev->of_node;
-    int proplen;
+	struct device_node *node = dev->of_node;
+	int proplen;
 
-    proplen = of_property_count_u32_elems(node, "gpu_cold_temp_list");
+	proplen = of_property_count_u32_elems(node, "gpu_cold_temp_list");
 
-    if (proplen <= 0)
-        return;
+	if (proplen <= 0)
+		return;
 
-    acpm_dvfs.gpu_coldtemp = kcalloc(proplen, sizeof(u32), GFP_KERNEL);
-    if (!acpm_dvfs.gpu_coldtemp) {
-        return;
-    }
+	acpm_dvfs.gpu_coldtemp = kcalloc(proplen, sizeof(u32), GFP_KERNEL);
+	if (!acpm_dvfs.gpu_coldtemp) {
+		pr_err("acpm_dvfs memory allocation fail\n");
+		return;
+	}
 
     if (of_property_read_u32_array(node, "gpu_cold_temp_list",
                        acpm_dvfs.gpu_coldtemp, proplen)) {
@@ -267,11 +267,11 @@ static void acpm_dvfs_get_gpu_cold_temp_list(struct device *dev)
         return;
     }
 
-    acpm_dvfs.gpu_len = proplen;
+	acpm_dvfs.gpu_len = proplen;
 
-    acpm_dvfs.gpu_tmu_notifier.notifier_call = acpm_gpu_tmu_notifier;
-    if (exynos_gpu_add_notifier(&acpm_dvfs.gpu_tmu_notifier))
-        dev_err(dev, "failed register gpu tmu notifier\n");
+	acpm_dvfs.gpu_tmu_notifier.notifier_call = acpm_gpu_tmu_notifier;
+	if (exynos_gpu_add_notifier(&acpm_dvfs.gpu_tmu_notifier))
+		dev_err(dev, "failed register gpu tmu notifier\n");
 }
 #endif
 

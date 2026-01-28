@@ -368,6 +368,8 @@ int exynos_hiu_set_freq(unsigned int id, unsigned int req_freq)
 
 	data->cur_freq = req_freq;
 
+	pr_debug("exynos-hiu: set REQDVFS to HIU : %ukHz\n", req_freq);
+
 	return 0;
 
 fail_request_on_sr0:
@@ -555,6 +557,8 @@ static int exynos_hiu_update_data(struct cpufreq_policy *policy)
 	__exynos_hiu_update_data(policy);
 
 	data->enabled = true;
+
+	pr_info("exynos-hiu: HIU data structure update complete\n");
 
 	return 0;
 }

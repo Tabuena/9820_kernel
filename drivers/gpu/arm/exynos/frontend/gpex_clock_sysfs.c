@@ -498,7 +498,7 @@ int gpex_clock_sysfs_init(struct _clock_info *_clk_info)
 					  set_min_lock_dvfs);
 	GPEX_UTILS_SYSFS_KOBJECT_FILE_ADD(gpu_mm_min_clock, show_mm_min_lock_dvfs,
 					  set_mm_min_lock_dvfs);
-	GPEX_UTILS_SYSFS_KOBJECT_FILE_ADD(gpu_clock, show_clock, set_clock);
+	GPEX_UTILS_SYSFS_KOBJECT_FILE_ADD_RO(gpu_clock, show_clock);
 	GPEX_UTILS_SYSFS_KOBJECT_FILE_ADD_RO(gpu_freq_table, show_gpu_freq_table);
 
 	return 0;

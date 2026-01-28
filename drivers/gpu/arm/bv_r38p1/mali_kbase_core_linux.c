@@ -3155,7 +3155,7 @@ static char gpuinfo_override[64];
  * Return: The number of bytes output to @buf.
  */
 static ssize_t gpuinfo_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
+				  struct device_attribute *attr, char *buf)
 {
 	static const struct gpu_product_id_name {
 		unsigned int id;
@@ -3295,10 +3295,7 @@ static ssize_t gpuinfo_store(struct device *dev, struct device_attribute *attr,
 
 	return count;
 }
-
-static DEVICE_ATTR_RW(gpuinfo);
-
-
+static DEVICE_ATTR_RO(gpuinfo);
 
 /**
  * dvfs_period_store - Store callback for the dvfs_period sysfs file.

@@ -57,16 +57,25 @@ static void gpex_dvfs_context_init(struct device **dev)
 
 	of_string = gpexbe_devicetree_get_str(governor);
 
-	dvfs.governor_type = G3D_DVFS_GOVERNOR_INTERACTIVE;
-	dvfs.interactive.highspeed_clock =
-		gpexbe_devicetree_get_int(interactive_info.highspeed_clock);
-	dvfs.interactive.highspeed_load =
-		gpexbe_devicetree_get_int(interactive_info.highspeed_load);
-	dvfs.interactive.highspeed_delay =
-		gpexbe_devicetree_get_int(interactive_info.highspeed_delay);
-
-	if (!strncmp("booster", of_string, strlen("booster")))
+	if (!strncmp("interactive", of_string, strlen("interactive"))) {
+		dvfs.governor_type = G3D_DVFS_GOVERNOR_INTERACTIVE;
+		dvfs.interactive.highspeed_clock =
+			gpexbe_devicetree_get_int(interactive_info.highspeed_clock);
+		dvfs.interactive.highspeed_load =
+			gpexbe_devicetree_get_int(interactive_info.highspeed_load);
+		dvfs.interactive.highspeed_delay =
+			gpexbe_devicetree_get_int(interactive_info.highspeed_delay);
+	} else if (!strncmp("joint", of_string, strlen("joint"))) {
+		dvfs.governor_type = G3D_DVFS_GOVERNOR_JOINT;
+	} else if (!strncmp("static", of_string, strlen("static"))) {
+		dvfs.governor_type = G3D_DVFS_GOVERNOR_STATIC;
+	} else if (!strncmp("booster", of_string, strlen("booster"))) {
 		dvfs.governor_type = G3D_DVFS_GOVERNOR_BOOSTER;
+	} else if (!strncmp("dynamic", of_string, strlen("dynamic"))) {
+		dvfs.governor_type = G3D_DVFS_GOVERNOR_DYNAMIC;
+	} else {
+		dvfs.governor_type = G3D_DVFS_GOVERNOR_DEFAULT;
+	}
 
 	for (i = 0; i < G3D_MAX_GOVERNOR_NUM; i++) {
 		gpu_dvfs_update_start_clk(i, gpex_clock_get_boot_clock());
@@ -113,6 +122,8 @@ static int kbase_platform_dvfs_event(u32 utilisation)
 		gpex_clock_set(clk);
 	}
 	mutex_unlock(&dvfs.handler_lock);
+
+	GPU_LOG(MALI_EXYNOS_DEBUG, "dvfs hanlder is called\n");
 
 	return 0;
 }

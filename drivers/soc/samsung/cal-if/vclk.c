@@ -45,11 +45,26 @@ static int vclk_pll_idx_for_rate(struct vclk *vclk, size_t member_idx,
     return -ENOENT;
 }
 
+static bool vclk_has_divider(const struct vclk *vclk)
+{
+    int i;
+
+    if (!vclk || !vclk->list)
+        return false;
+
+    for (i = 0; i < vclk->num_list; i++) {
+        if (GET_TYPE(vclk->list[i]) == DIV_TYPE)
+            return true;
+    }
+
+    return false;
+}
+
 static void vclk_normalize_pll_params(struct vclk *vclk)
 {
     int i, k;
 
-    if (!vclk || !vclk->lut)
+    if (!vclk || !vclk->lut || vclk_has_divider(vclk))
         return;
 
     for (i = 0; i < vclk->num_rates; i++) {
@@ -769,7 +784,8 @@ static int vclk_get_dfs_info(struct vclk *vclk) {
 
 
     /* Make sure PLL params reflect actual PLL table indices for this rate */
-    vclk_normalize_pll_params(vclk);
+    if (!vclk_has_divider(vclk))
+        vclk_normalize_pll_params(vclk);
 
     return ret;
 

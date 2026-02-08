@@ -27,6 +27,7 @@ static int percent_margin_table[MAX_MARGIN_ID];
 
 /* S10-only: G3D manual FV table overrides (definitions at end of file). */
 static const struct rate_volt g3d_manual_ratevolt[];
+static size_t g3d_manual_lv_count(void);
 static int patch_tables(volatile struct fvmap_header *hdr, const struct rate_volt_header *old_rv,
 			const struct dvfs_table *old_param, struct rate_volt_header *new_rv,
 			struct dvfs_table *new_param, struct vclk *vclk, size_t old_lv);
@@ -445,7 +446,7 @@ static void fvmap_copy_from_sram(void __iomem *map_base, void __iomem *sram_base
 		is_g3d = !strcmp(vclk->name, "dvfs_g3d");
 		old_lv = fvmap_header[i].num_of_lv;
 		if (is_g3d)
-			fvmap_header[i].num_of_lv = ARRAY_SIZE(g3d_manual_ratevolt);
+			fvmap_header[i].num_of_lv = g3d_manual_lv_count();
 
 		pr_info("dvfs_type : %s - id : %x\n", vclk->name, fvmap_header[i].dvfs_type);
 		pr_info("  num_of_lv      : %d\n", fvmap_header[i].num_of_lv);
@@ -561,6 +562,11 @@ static size_t g3d_lut_override_cap;
 	G3D_MANUAL_RATE(rate_khz, volt_uv),
 static const struct rate_volt g3d_manual_ratevolt[] = {G3D_DVFS_TABLE_ENTRY_LIST(G3D_MANUAL_ENTRY)};
 #undef G3D_MANUAL_ENTRY
+
+static size_t g3d_manual_lv_count(void)
+{
+	return ARRAY_SIZE(g3d_manual_ratevolt);
+}
 
 static size_t g3d_find_closest_lv(const struct rate_volt_header *old_rv, size_t old_lv,
 				  unsigned int target_rate)

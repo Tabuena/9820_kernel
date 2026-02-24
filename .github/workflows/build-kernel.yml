@@ -35,7 +35,7 @@ on:
           - n
           - y
       gpu_max:
-        description: GPU max MHz (forOC tables, default: 702)
+        description: "GPU max MHz (for OC tables, default: 702)"
         required: true
         default: "702"
         type: string

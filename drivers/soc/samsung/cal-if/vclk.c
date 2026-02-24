@@ -153,7 +153,7 @@ static int __vclk_set_rate(unsigned int id, unsigned int rate, int cmd)
 	if (!vclk || !vclk->lut)
 		return -EVCLKINVAL;
 
-	if (IS_DFS_VCLK(id) || IS_COMMON_VCLK(id))
+	if (IS_DFS_VCLK(id) || IS_COMMON_VCLK(id) || IS_ACPM_VCLK(id))
 		new_lut = get_lut(vclk, rate);
 	else
 		new_lut = get_lut(vclk, rate / 1000);

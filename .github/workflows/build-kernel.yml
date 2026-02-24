@@ -38,7 +38,28 @@ on:
         description: "GPU max MHz (for OC tables, default: 702)"
         required: true
         default: "702"
-        type: string
+        type: choice
+        options:
+          - "100"
+          - "156"
+          - "200"
+          - "260"
+          - "325"
+          - "377"
+          - "433"
+          - "572"
+          - "598"
+          - "650"
+          - "676"
+          - "702"
+          - "754"
+          - "806"
+          - "858"
+          - "910"
+          - "962"
+          - "1014"
+          - "1066"
+          - "1092"
 
 permissions:
   contents: read

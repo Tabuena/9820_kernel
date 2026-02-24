@@ -1,1006 +1,684 @@
-#include <linux/io.h>
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/string.h>
 #include <linux/types.h>
+#include <linux/kernel.h>
+#include <linux/io.h>
 #include <soc/samsung/ect_parser.h>
 
+#include "cmucal.h"
+#include "vclk.h"
+#include "ra.h"
 #include "acpm_dvfs.h"
 #include "asv.h"
-#include "cmucal.h"
-#include "gpu_dvfs_overrides.h"
-#include "ra.h"
-#include "vclk.h"
-#include <linux/errno.h>
-#include <linux/printk.h>
 
-#define ECT_DUMMY_SFR (0xFFFFFFFF)
+#define ECT_DUMMY_SFR	(0xFFFFFFFF)
 unsigned int asv_table_ver = 0;
 unsigned int main_rev;
 unsigned int sub_rev;
 
-static int vclk_pll_idx_for_rate(struct vclk *vclk, size_t member_idx,
-                                 unsigned int rate_khz)
+static struct vclk_lut *get_lut(struct vclk *vclk, unsigned int rate)
 {
-    struct cmucal_pll *pll;
-    unsigned int clk_id;
-    int idx;
+	int i;
 
-    if (!vclk || member_idx >= vclk->num_list)
-        return -EINVAL;
+	for (i = 0; i < vclk->num_rates; i++)
+		if (rate >= vclk->lut[i].rate)
+			break;
 
-    clk_id = vclk->list[member_idx];
-    if (!IS_PLL(clk_id))
-        return -EOPNOTSUPP;
+	if (i == vclk->num_rates)
+		return NULL;
 
-    pll = cmucal_get_node(clk_id);
-    if (!pll || !pll->rate_table || pll->rate_count <= 0)
-        return -EINVAL;
-
-    for (idx = 0; idx < pll->rate_count; idx++) {
-        if (pll->rate_table[idx].rate / 1000 == rate_khz)
-            return idx;
-    }
-
-    return -ENOENT;
+	return &vclk->lut[i];
 }
 
-static bool vclk_has_divider(const struct vclk *vclk)
+static unsigned int get_max_rate(unsigned int from, unsigned int to)
 {
-    int i;
+	unsigned int max_rate;
 
-    if (!vclk || !vclk->list)
-        return false;
+	if (from)
+		max_rate = (from > to) ? from : to;
+	else
+		max_rate = to;
 
-    for (i = 0; i < vclk->num_list; i++) {
-        if (GET_TYPE(vclk->list[i]) == DIV_TYPE)
-            return true;
-    }
-
-    return false;
+	return max_rate;
 }
 
-static void vclk_normalize_pll_params(struct vclk *vclk)
+static void __select_switch_pll(struct vclk *vclk,
+				unsigned int rate,
+				unsigned int select)
 {
-    int i, k;
+	if (vclk->ops && vclk->ops->switch_pre)
+		vclk->ops->switch_pre(vclk->vrate, rate);
 
-    if (!vclk || !vclk->lut || vclk_has_divider(vclk))
-        return;
+	if (vclk->ops && vclk->ops->switch_trans && select)
+		vclk->ops->switch_trans(vclk->vrate, rate);
+	else if (vclk->ops && vclk->ops->restore_trans && !select)
+		vclk->ops->restore_trans(vclk->vrate, rate);
+	else
+		ra_select_switch_pll(vclk->switch_info, select);
 
-    for (i = 0; i < vclk->num_rates; i++) {
-        struct vclk_lut *lut = &vclk->lut[i];
-
-        if (!lut->params)
-            continue;
-
-        for (k = 0; k < vclk->num_list; k++) {
-            int pll_idx = vclk_pll_idx_for_rate(vclk, k, lut->rate);
-
-            if (pll_idx < 0)
-                continue;
-
-            if (lut->params[k] != pll_idx) {
-                lut->params[k] = pll_idx;
-            }
-        }
-    }
-}
-
-static struct vclk_lut *get_lut(struct vclk *vclk, unsigned int rate) {
-    int i;
-
-    for (i = 0; i < vclk->num_rates; i++)
-        if (rate >= vclk->lut[i].rate)
-            break;
-
-    if (i == vclk->num_rates)
-        return NULL;
-
-    return &vclk->lut[i];
-}
-
-static unsigned int get_max_rate(unsigned int from, unsigned int to) {
-    unsigned int max_rate;
-
-    if (from)
-        max_rate = (from > to) ? from : to;
-    else
-        max_rate = to;
-
-    return max_rate;
-}
-
-static void __select_switch_pll(struct vclk *vclk, unsigned int rate,
-                                unsigned int select) {
-    if (vclk->ops && vclk->ops->switch_pre)
-        vclk->ops->switch_pre(vclk->vrate, rate);
-
-    if (vclk->ops && vclk->ops->switch_trans && select)
-        vclk->ops->switch_trans(vclk->vrate, rate);
-    else if (vclk->ops && vclk->ops->restore_trans && !select)
-        vclk->ops->restore_trans(vclk->vrate, rate);
-    else
-        ra_select_switch_pll(vclk->switch_info, select);
-
-    if (vclk->ops && vclk->ops->switch_post)
-        vclk->ops->switch_post(vclk->vrate, rate);
+	if (vclk->ops && vclk->ops->switch_post)
+		vclk->ops->switch_post(vclk->vrate, rate);
 }
 
 static int transition_switch(struct vclk *vclk, struct vclk_lut *lut,
-                             unsigned int switch_rate) {
-    unsigned int *list = vclk->list;
-    unsigned int num_list = vclk->num_list;
+			     unsigned int switch_rate)
+{
+	unsigned int *list = vclk->list;
+	unsigned int num_list = vclk->num_list;
 
-    /* Change to swithing PLL */
-    if (vclk->ops && vclk->ops->trans_pre)
-        vclk->ops->trans_pre(vclk->vrate, lut->rate);
+	/* Change to swithing PLL */
+	if (vclk->ops && vclk->ops->trans_pre)
+		vclk->ops->trans_pre(vclk->vrate, lut->rate);
 
-    ra_set_clk_by_type(list, lut, num_list, DIV_TYPE, TRANS_HIGH);
+	ra_set_clk_by_type(list, lut, num_list, DIV_TYPE, TRANS_HIGH);
 
-    __select_switch_pll(vclk, switch_rate, 1);
+	__select_switch_pll(vclk, switch_rate, 1);
 
-    ra_set_clk_by_type(list, lut, num_list, MUX_TYPE, TRANS_FORCE);
-    ra_set_clk_by_type(list, lut, num_list, DIV_TYPE, TRANS_LOW);
+	ra_set_clk_by_type(list, lut, num_list, MUX_TYPE, TRANS_FORCE);
+	ra_set_clk_by_type(list, lut, num_list, DIV_TYPE, TRANS_LOW);
 
-    vclk->vrate = switch_rate;
+	vclk->vrate = switch_rate;
 
-    return 0;
+	return 0;
 }
 
-static int transition_restore(struct vclk *vclk, struct vclk_lut *lut) {
-    unsigned int *list = vclk->list;
-    unsigned int num_list = vclk->num_list;
+static int transition_restore(struct vclk *vclk, struct vclk_lut *lut)
+{
+	unsigned int *list = vclk->list;
+	unsigned int num_list = vclk->num_list;
 
-    /* PLL setting */
-    ra_set_pll_ops(list, lut, num_list, vclk->ops);
+	/* PLL setting */
+	ra_set_pll_ops(list, lut, num_list, vclk->ops);
 
-    ra_set_clk_by_type(list, lut, num_list, DIV_TYPE, TRANS_HIGH);
+	ra_set_clk_by_type(list, lut, num_list, DIV_TYPE, TRANS_HIGH);
 
-    __select_switch_pll(vclk, lut->rate, 0);
+	__select_switch_pll(vclk, lut->rate, 0);
 
-    ra_set_clk_by_type(list, lut, num_list, MUX_TYPE, TRANS_FORCE);
-    ra_set_clk_by_type(list, lut, num_list, DIV_TYPE, TRANS_LOW);
-    if (vclk->ops && vclk->ops->trans_post)
-        vclk->ops->trans_post(vclk->vrate, lut->rate);
+	ra_set_clk_by_type(list, lut, num_list, MUX_TYPE, TRANS_FORCE);
+	ra_set_clk_by_type(list, lut, num_list, DIV_TYPE, TRANS_LOW);
+	if (vclk->ops && vclk->ops->trans_post)
+		vclk->ops->trans_post(vclk->vrate, lut->rate);
 
-    return 0;
+	return 0;
 }
 
-static int transition(struct vclk *vclk, struct vclk_lut *lut) {
-    unsigned int *list = vclk->list;
-    unsigned int num_list = vclk->num_list;
+static int transition(struct vclk *vclk,
+		      struct vclk_lut *lut)
+{
+	unsigned int *list = vclk->list;
+	unsigned int num_list = vclk->num_list;
 
+	ra_set_clk_by_type(list, lut, num_list, DIV_TYPE, TRANS_HIGH);
+	ra_set_clk_by_type(list, lut, num_list, PLL_TYPE, TRANS_LOW);
+	ra_set_clk_by_type(list, lut, num_list, MUX_TYPE, TRANS_FORCE);
+	ra_set_clk_by_type(list, lut, num_list, PLL_TYPE, TRANS_HIGH);
+	ra_set_clk_by_type(list, lut, num_list, DIV_TYPE, TRANS_LOW);
 
-    ra_set_clk_by_type(list, lut, num_list, DIV_TYPE, TRANS_HIGH);
-    ra_set_clk_by_type(list, lut, num_list, PLL_TYPE, TRANS_LOW);
-    ra_set_clk_by_type(list, lut, num_list, MUX_TYPE, TRANS_FORCE);
-    ra_set_clk_by_type(list, lut, num_list, PLL_TYPE, TRANS_HIGH);
-    ra_set_clk_by_type(list, lut, num_list, DIV_TYPE, TRANS_LOW);
-
-    return 0;
+	return 0;
 }
 
-static bool is_switching_pll_ops(struct vclk *vclk, int cmd) {
-    int i;
+static bool is_switching_pll_ops(struct vclk *vclk, int cmd)
+{
+	int i;
 
-    if (!vclk->switch_info)
-        return false;
+	if (!vclk->switch_info)
+		return false;
 
-    if (cmd != ONESHOT_TRANS)
-        return true;
+	if (cmd != ONESHOT_TRANS)
+		return true;
 
-    for (i = 0; i < vclk->num_list; i++) {
-        if (IS_PLL(vclk->list[i]))
-            return true;
-    }
+	for (i = 0; i < vclk->num_list; i++) {
+		if (IS_PLL(vclk->list[i]))
+			return true;
+	}
 
-    return false;
+	return false;
 }
 
-static int __vclk_set_rate(unsigned int id, unsigned int rate, int cmd) {
-    struct vclk *vclk;
-    struct vclk_lut *new_lut, *switch_lut;
-    unsigned int switch_rate, max_rate;
+static int __vclk_set_rate(unsigned int id, unsigned int rate, int cmd)
+{
+	struct vclk *vclk;
+	struct vclk_lut *new_lut, *switch_lut;
+	unsigned int switch_rate, max_rate;
 
-    if (!IS_VCLK(id)) {
-        return ra_set_rate(id, rate);
-    }
+	if (!IS_VCLK(id))
+		return ra_set_rate(id, rate);
 
-    vclk = cmucal_get_node(id);
+	vclk = cmucal_get_node(id);
+	if (!vclk || !vclk->lut)
+		return -EVCLKINVAL;
 
-    if (!vclk) {
-        return -EVCLKINVAL;
-    }
+	if (IS_DFS_VCLK(id) || IS_COMMON_VCLK(id))
+		new_lut = get_lut(vclk, rate);
+	else
+		new_lut = get_lut(vclk, rate / 1000);
 
+	if (!new_lut)
+		return -EVCLKINVAL;
 
-    if (!vclk->lut) {
-        return -EVCLKINVAL;
-    }
+	if (is_switching_pll_ops(vclk, cmd)) {
+		switch_lut = new_lut;
+		switch_rate = rate;
+		if (is_oneshot_trans(cmd)) {
+			max_rate = get_max_rate(vclk->vrate, rate);
+			switch_rate = ra_set_rate_switch(vclk->switch_info,
+							 max_rate);
+			switch_lut = get_lut(vclk, switch_rate);
+			if (!switch_lut)
+				return -EVCLKINVAL;
+		}
+		if (is_switch_trans(cmd))
+			transition_switch(vclk, switch_lut, switch_rate);
+		if (is_restore_trans(cmd))
+			transition_restore(vclk, new_lut);
+	} else if (vclk->seq) {
+		ra_set_clk_by_seq(vclk->list,
+				  new_lut,
+				  vclk->seq,
+				  vclk->num_list);
+	} else {
+		transition(vclk, new_lut);
+	}
 
-    /* Determine LUT lookup rate unit */
-    if (IS_DFS_VCLK(id) || IS_COMMON_VCLK(id) || IS_ACPM_VCLK(id)) {
-        new_lut = get_lut(vclk, rate);
-    } else {
-        new_lut = get_lut(vclk, rate / 1000);
-    }
+	vclk->vrate = rate;
 
-
-    if (!new_lut) {
-        return -EVCLKINVAL;
-    }
-
-    if (is_switching_pll_ops(vclk, cmd)) {
-
-        switch_lut = new_lut;
-        switch_rate = rate;
-
-
-        if (is_oneshot_trans(cmd)) {
-            max_rate = get_max_rate(vclk->vrate, rate);
-
-            switch_rate = ra_set_rate_switch(vclk->switch_info, max_rate);
-
-            switch_lut = get_lut(vclk, switch_rate);
-
-            if (!switch_lut) {
-                return -EVCLKINVAL;
-            }
-        }
-
-        if (is_switch_trans(cmd)) {
-            transition_switch(vclk, switch_lut, switch_rate);
-        }
-
-        if (is_restore_trans(cmd)) {
-            transition_restore(vclk, new_lut);
-        }
-    } else if (vclk->seq) {
-        ra_set_clk_by_seq(vclk->list, new_lut, vclk->seq, vclk->num_list);
-    } else {
-        transition(vclk, new_lut);
-    }
-
-    vclk->vrate = rate;
-
-    return 0;
+	return 0;
 }
 
-int vclk_set_rate(unsigned int id, unsigned long rate) {
-    int ret;
+int vclk_set_rate(unsigned int id, unsigned long rate)
+{
+	int ret;
 
+	ret = __vclk_set_rate(id, rate, ONESHOT_TRANS);
 
-    ret = __vclk_set_rate(id, (unsigned int)rate, ONESHOT_TRANS);
-
-    return ret;
+	return ret;
 }
 
-int vclk_set_rate_switch(unsigned int id, unsigned long rate) {
-    int ret;
+int vclk_set_rate_switch(unsigned int id, unsigned long rate)
+{
+	int ret;
 
+	ret = __vclk_set_rate(id, rate, SWITCH_TRANS);
 
-    ret = __vclk_set_rate(id, (unsigned int)rate, SWITCH_TRANS);
-
-    return ret;
+	return ret;
 }
 
-int vclk_set_rate_restore(unsigned int id, unsigned long rate) {
-    int ret;
+int vclk_set_rate_restore(unsigned int id, unsigned long rate)
+{
+	int ret;
 
+	ret = __vclk_set_rate(id, rate, RESTORE_TRANS);
 
-    ret = __vclk_set_rate(id, (unsigned int)rate, RESTORE_TRANS);
-
-    return ret;
+	return ret;
 }
 
-unsigned long vclk_recalc_rate(unsigned int id) {
-    struct vclk *vclk;
-    int i, ret;
+unsigned long vclk_recalc_rate(unsigned int id)
+{
+	struct vclk *vclk;
+	int i, ret;
 
+	if (!IS_VCLK(id))
+		return ra_recalc_rate(id);
 
-    if (!IS_VCLK(id)) {
-        unsigned long r = ra_recalc_rate(id);
-        return r;
-    }
+	vclk = cmucal_get_node(id);
+	if (!vclk)
+		return 0;
 
-    vclk = cmucal_get_node(id);
-    if (!vclk) {
-        return 0;
-    }
+	if (IS_DFS_VCLK(vclk->id) ||
+	    IS_COMMON_VCLK(vclk->id) ||
+	    IS_ACPM_VCLK(vclk->id)) {
+		for (i = 0; i < vclk->num_rates; i++) {
+			ret = ra_compare_clk_list(vclk->lut[i].params,
+						  vclk->list,
+						  vclk->num_list);
+			if (!ret) {
+				vclk->vrate = vclk->lut[i].rate;
+				break;
+			}
+		}
 
+		if (i == vclk->num_rates) {
+			vclk->vrate = 0;
+			pr_debug("%s:%x failed\n", __func__, id);
+		}
+	} else {
+		vclk->vrate = ra_recalc_rate(vclk->list[0]);
+	}
 
-    if (IS_DFS_VCLK(vclk->id) || IS_COMMON_VCLK(vclk->id) ||
-        IS_ACPM_VCLK(vclk->id)) {
-
-        if (!vclk->lut) {
-            vclk->vrate = 0;
-            return 0;
-        }
-
-        for (i = 0; i < vclk->num_rates; i++) {
-
-            ret = ra_compare_clk_list(vclk->lut[i].params, vclk->list,
-                                      vclk->num_list);
-
-
-            if (!ret) {
-                vclk->vrate = vclk->lut[i].rate;
-                break;
-            }
-        }
-
-        if (i == vclk->num_rates) {
-            vclk->vrate = 0;
-        }
-    } else {
-        unsigned long r;
-
-
-        if (!vclk->list) {
-            vclk->vrate = 0;
-            return 0;
-        }
-
-
-        r = ra_recalc_rate(vclk->list[0]);
-
-
-        vclk->vrate = r;
-    }
-
-    return vclk->vrate;
+	return vclk->vrate;
 }
 
-unsigned long vclk_get_rate(unsigned int id) {
-    struct vclk *vclk;
+unsigned long vclk_get_rate(unsigned int id)
+{
+	struct vclk *vclk;
 
-    if (IS_VCLK(id)) {
-        vclk = cmucal_get_node(id);
-        if (vclk)
-            return vclk->vrate;
-    }
+	if (IS_VCLK(id)) {
+		vclk = cmucal_get_node(id);
+		if (vclk)
+			return vclk->vrate;
+	}
 
-    return 0;
+	return 0;
 }
 
-int vclk_set_enable(unsigned int id) {
-    struct vclk *vclk;
-    int ret = -EVCLKINVAL;
+int vclk_set_enable(unsigned int id)
+{
+	struct vclk *vclk;
+	int ret = -EVCLKINVAL;
 
-    if (IS_GATE_VCLK(id)) {
-        vclk = cmucal_get_node(id);
-        if (vclk)
-            ret = ra_set_list_enable(vclk->list, vclk->num_list);
-    } else if (IS_VCLK(id)) {
-        ret = 0;
-    } else {
-        ret = ra_set_enable(id, 1);
-    }
+	if (IS_GATE_VCLK(id)) {
+		vclk = cmucal_get_node(id);
+		if (vclk)
+			ret = ra_set_list_enable(vclk->list, vclk->num_list);
+	} else if (IS_VCLK(id)){
+		ret = 0;
+	} else {
+		ret = ra_set_enable(id, 1);
+	}
 
-    return ret;
+	return ret;
 }
 
-int vclk_set_disable(unsigned int id) {
-    struct vclk *vclk;
-    int ret = -EVCLKINVAL;
+int vclk_set_disable(unsigned int id)
+{
+	struct vclk *vclk;
+	int ret = -EVCLKINVAL;
 
-    if (IS_GATE_VCLK(id)) {
-        vclk = cmucal_get_node(id);
-        if (vclk)
-            ret = ra_set_list_disable(vclk->list, vclk->num_list);
-    } else if (IS_VCLK(id)) {
-        ret = 0;
-    } else {
-        ret = ra_set_enable(id, 0);
-    }
+	if (IS_GATE_VCLK(id)) {
+		vclk = cmucal_get_node(id);
+		if (vclk)
+			ret = ra_set_list_disable(vclk->list, vclk->num_list);
+	} else if (IS_VCLK(id)){
+		ret = 0;
+	} else {
+		ret = ra_set_enable(id, 0);
+	}
 
-    return ret;
+	return ret;
 }
 
-unsigned int vclk_get_lv_num(unsigned int id) {
-    struct vclk *vclk;
-    int lv_num = 0;
+unsigned int vclk_get_lv_num(unsigned int id)
+{
+	struct vclk *vclk;
+	int lv_num = 0;
 
-    vclk = cmucal_get_node(id);
+	vclk = cmucal_get_node(id);
 
-    if (vclk && vclk->lut)
-        lv_num = vclk->num_rates;
+	if (vclk && vclk->lut)
+		lv_num = vclk->num_rates;
 
-    return lv_num;
+	return lv_num;
+
 }
 
-unsigned int vclk_get_max_freq(unsigned int id) {
-    struct vclk *vclk;
-    int rate = 0;
+unsigned int vclk_get_max_freq(unsigned int id)
+{
+	struct vclk *vclk;
+	int rate = 0;
 
-    vclk = cmucal_get_node(id);
+	vclk = cmucal_get_node(id);
 
-    if (vclk && vclk->lut)
-        rate = vclk->max_freq;
+	if (vclk && vclk->lut)
+		rate = vclk->max_freq;
 
-    return rate;
+	return rate;
 }
 
-unsigned int vclk_get_min_freq(unsigned int id) {
-    struct vclk *vclk;
-    int rate = 0;
+unsigned int vclk_get_min_freq(unsigned int id)
+{
+	struct vclk *vclk;
+	int rate = 0;
 
-    vclk = cmucal_get_node(id);
+	vclk = cmucal_get_node(id);
 
-    if (vclk && vclk->lut)
-        rate = vclk->min_freq;
+	if (vclk && vclk->lut)
+		rate = vclk->min_freq;
 
-    return rate;
+	return rate;
 }
 
-int vclk_get_rate_table(unsigned int id, unsigned long *table) {
-    struct vclk *vclk;
-    int i;
-    unsigned int nums = 0;
+int vclk_get_rate_table(unsigned int id, unsigned long *table)
+{
+	struct vclk *vclk;
+	int i;
+	unsigned int nums = 0;
 
-    vclk = cmucal_get_node(id);
+	vclk = cmucal_get_node(id);
+	if (!vclk || !IS_VCLK(vclk->id))
+		return 0;
+	if (vclk->lut) {
+		for (i = 0; i < vclk->num_rates; i++)
+			table[i] = vclk->lut[i].rate;
+		nums = vclk->num_rates;
+	}
 
-    if (!vclk) {
-        return 0;
-    }
-
-    if (!IS_VCLK(vclk->id)) {
-        return 0;
-    }
-
-    if (!table) {
-        return 0;
-    }
-
-    if (vclk->lut) {
-        for (i = 0; i < vclk->num_rates; i++) {
-            table[i] = vclk->lut[i].rate;
-        }
-        nums = vclk->num_rates;
-    }
-
-    return nums;
+	return nums;
 }
 
-int vclk_get_bigturbo_table(unsigned int *table) {
-    void *gen_block;
-    struct ect_gen_param_table *bigturbo;
-    int idx;
-    int i;
+int vclk_get_bigturbo_table(unsigned int *table)
+{
+	void *gen_block;
+	struct ect_gen_param_table *bigturbo;
+	int idx;
+	int i;
 
-    gen_block = ect_get_block("GEN");
-    if (gen_block == NULL)
-        return -EVCLKINVAL;
+	gen_block = ect_get_block("GEN");
+	if (gen_block == NULL)
+		return -EVCLKINVAL;
 
-    bigturbo = ect_gen_param_get_table(gen_block, "BIGTURBO");
-    if (bigturbo == NULL)
-        return -EVCLKINVAL;
+	bigturbo = ect_gen_param_get_table(gen_block, "BIGTURBO");
+	if (bigturbo == NULL)
+		return -EVCLKINVAL;
 
-    if (bigturbo->num_of_row == 0)
-        return -EVCLKINVAL;
+	if (bigturbo->num_of_row == 0)
+		return -EVCLKINVAL;
 
-    if (asv_table_ver >= bigturbo->num_of_row)
-        idx = bigturbo->num_of_row - 1;
-    else
-        idx = asv_table_ver;
+	if (asv_table_ver >= bigturbo->num_of_row)
+		idx = bigturbo->num_of_row - 1;
+	else
+		idx = asv_table_ver;
 
-    for (i = 0; i < bigturbo->num_of_col; i++)
-        table[i] = bigturbo->parameter[idx * bigturbo->num_of_col + i];
+	for (i = 0; i < bigturbo->num_of_col; i++)
+		table[i] = bigturbo->parameter[idx * bigturbo->num_of_col + i];
 
-    return 0;
+	return 0;
 }
 
-unsigned int vclk_get_boot_freq(unsigned int id) {
-    struct vclk *vclk;
-    unsigned int rate = 0;
+unsigned int vclk_get_boot_freq(unsigned int id)
+{
+	struct vclk *vclk;
+	unsigned int rate = 0;
 
-    vclk = cmucal_get_node(id);
-    if (!vclk || !(IS_DFS_VCLK(vclk->id) || IS_ACPM_VCLK(vclk->id)))
-        return rate;
+	vclk = cmucal_get_node(id);
+	if (!vclk || !(IS_DFS_VCLK(vclk->id) || IS_ACPM_VCLK(vclk->id)))
+		return rate;
 
-    if (vclk->boot_freq)
-        rate = vclk->boot_freq;
-    else
-        rate = (unsigned int)vclk_recalc_rate(id);
+	if (vclk->boot_freq)
+		rate = vclk->boot_freq;
+	else
+		rate = (unsigned int)vclk_recalc_rate(id);
 
-    return rate;
+	return rate;
 }
 
-unsigned int vclk_get_resume_freq(unsigned int id) {
-    struct vclk *vclk;
-    unsigned int rate = 0;
+unsigned int vclk_get_resume_freq(unsigned int id)
+{
+	struct vclk *vclk;
+	unsigned int rate = 0;
 
-    vclk = cmucal_get_node(id);
-    if (!vclk || !(IS_DFS_VCLK(vclk->id) || IS_ACPM_VCLK(vclk->id)))
-        return rate;
+	vclk = cmucal_get_node(id);
+	if (!vclk || !(IS_DFS_VCLK(vclk->id) || IS_ACPM_VCLK(vclk->id)))
+		return rate;
 
-    if (vclk->resume_freq)
-        rate = vclk->resume_freq;
-    else
-        rate = (unsigned int)vclk_recalc_rate(id);
+	if (vclk->resume_freq)
+		rate = vclk->resume_freq;
+	else
+		rate = (unsigned int)vclk_recalc_rate(id);
 
-    return rate;
+	return rate;
 }
 
-static int vclk_get_dfs_info(struct vclk *vclk) {
-    int i, j, k;
-    void *dvfs_block;
-    struct ect_dvfs_domain *dvfs_domain;
-    void *gen_block;
-    struct ect_gen_param_table *minmax = NULL;
-    unsigned int *minmax_table = NULL;
-    int *params, idx;
-    int original_num_rates;
-    int alloc_num_rates;
-    unsigned int original_max_rate = 0;
-    unsigned long highest_override = 0;
-    size_t override_count = 0;
-    bool is_gpu = false;
-    bool descending = false;
-    int current_num_rates;
-    int ret = 0;
-    char buf[32];
-
-    if (!vclk || !vclk->name) {
-        return -EVCLKINVAL;
-    }
-
-    dvfs_block = ect_get_block("DVFS");
-    if (dvfs_block == NULL)
-        return -EVCLKNOENT;
-
-    dvfs_domain = ect_dvfs_get_domain(dvfs_block, vclk->name);
-    if (dvfs_domain == NULL)
-        return -EVCLKINVAL;
-
-
-
-    /* GEN/MINMAX lookup */
-    gen_block = ect_get_block("GEN");
-
-    if (gen_block) {
-        snprintf(buf, sizeof(buf), "MINMAX_%s", vclk->name);
-
-        minmax = ect_gen_param_get_table(gen_block, buf);
-
-        if (minmax != NULL) {
-
-            for (i = 0; i < minmax->num_of_row; i++) {
-                minmax_table = &minmax->parameter[minmax->num_of_col * i];
-
-                if (minmax_table && minmax_table[0] == asv_table_ver) {
-                    break;
-                }
-            }
-        }
-    }
-
-    /* Populate vclk core fields from DVFS domain */
-    vclk->num_rates = dvfs_domain->num_of_level;
-    vclk->num_list = dvfs_domain->num_of_clock;
-    vclk->max_freq = dvfs_domain->max_frequency;
-    vclk->min_freq = dvfs_domain->min_frequency;
-
-    original_num_rates = vclk->num_rates;
-    alloc_num_rates = original_num_rates;
-    is_gpu = !strcmp(vclk->name, "dvfs_g3d");
-
-
-    if (is_gpu && gpu_dvfs_has_overrides()) {
-        override_count = gpu_dvfs_override_count();
-        if (override_count)
-            alloc_num_rates += override_count;
-    } else if (is_gpu) {
-    }
-
-    if (minmax_table != NULL) {
-
-        vclk->min_freq = minmax_table[MINMAX_MIN_FREQ] * 1000;
-        vclk->max_freq = minmax_table[MINMAX_MAX_FREQ] * 1000;
-    } else {
-    }
-
-
-    /* Allocate list + lut */
-    vclk->list = kzalloc(sizeof(unsigned int) * vclk->num_list, GFP_KERNEL);
-    if (!vclk->list)
-        return -EVCLKNOMEM;
-
-    vclk->lut = kzalloc(sizeof(struct vclk_lut) * alloc_num_rates, GFP_KERNEL);
-    if (!vclk->lut) {
-        ret = -EVCLKNOMEM;
-        goto err_nomem1;
-    }
-
-    /* Fill lut[] from DVFS domain */
-
-    for (i = 0; i < original_num_rates; i++) {
-        vclk->lut[i].rate = dvfs_domain->list_level[i].level;
-
-
-        params = kcalloc(vclk->num_list, sizeof(int), GFP_KERNEL);
-
-        if (!params) {
-            ret = -EVCLKNOMEM;
-            if (i == 0)
-                goto err_nomem2;
-
-            for (i = i - 1; i >= 0; i--)
-                kfree(vclk->lut[i].params);
-            goto err_nomem2;
-        }
-
-        for (j = 0; j < vclk->num_list; ++j) {
-            idx = i * vclk->num_list + j;
-            params[j] = dvfs_domain->list_dvfs_value[idx];
-        }
-        vclk->lut[i].params = params;
-
-    }
-
-    vclk->boot_freq = 0;
-    vclk->resume_freq = 0;
-
-    /* Boot/resume freq selection */
-    if (minmax_table != NULL) {
-        unsigned int want_boot = minmax_table[MINMAX_BOOT_FREQ] * 1000;
-        unsigned int want_resume = minmax_table[MINMAX_RESUME_FREQ] * 1000;
-
-
-        for (i = 0; i < vclk->num_rates; i++)
-            if (vclk->lut[i].rate == want_boot)
-                vclk->boot_freq = vclk->lut[i].rate;
-
-        for (i = 0; i < vclk->num_rates; i++)
-            if (vclk->lut[i].rate == want_resume)
-                vclk->resume_freq = vclk->lut[i].rate;
-    } else {
-
-        if (dvfs_domain->boot_level_idx != -1)
-            vclk->boot_freq = vclk->lut[dvfs_domain->boot_level_idx].rate;
-
-        if (dvfs_domain->resume_level_idx != -1)
-            vclk->resume_freq = vclk->lut[dvfs_domain->resume_level_idx].rate;
-    }
-
-    current_num_rates = original_num_rates;
-
-    /* Determine original max rate and sort direction */
-    for (i = 0; i < original_num_rates; i++)
-        if (vclk->lut[i].rate > original_max_rate)
-            original_max_rate = vclk->lut[i].rate;
-
-    if (original_num_rates >= 2)
-        descending = vclk->lut[1].rate < vclk->lut[0].rate;
-
-
-    /* GPU override insertion */
-    if (is_gpu && override_count) {
-        size_t override_idx;
-
-
-        for (override_idx = 0; override_idx < override_count; override_idx++) {
-            const struct gpu_dvfs_override_entry *entry;
-            unsigned int *override_params;
-            int insert_idx = current_num_rates;
-            int template_idx;
-            bool found = false;
-
-            entry = gpu_dvfs_override_get(override_idx);
-            if (!entry)
-                continue;
-
-
-            highest_override = max(highest_override, entry->rate_khz);
-
-            /* Find duplicate or insertion position */
-            for (i = 0; i < current_num_rates; i++) {
-                if (vclk->lut[i].rate == entry->rate_khz) {
-                    found = true;
-                    break;
-                }
-
-                if (descending) {
-                    if (entry->rate_khz > vclk->lut[i].rate &&
-                        insert_idx == current_num_rates)
-                        insert_idx = i;
-                } else {
-                    if (entry->rate_khz < vclk->lut[i].rate &&
-                        insert_idx == current_num_rates)
-                        insert_idx = i;
-                }
-            }
-
-
-            if (found)
-                continue;
-
-            if (insert_idx > current_num_rates)
-                insert_idx = current_num_rates;
-
-            if (!current_num_rates) {
-                ret = -EVCLKNOMEM;
-                goto err_nomem_override;
-            }
-
-            template_idx = (insert_idx < current_num_rates)
-                               ? insert_idx
-                               : current_num_rates - 1;
-
-
-            override_params = kcalloc(vclk->num_list, sizeof(int), GFP_KERNEL);
-            if (!override_params) {
-                ret = -EVCLKNOMEM;
-                goto err_nomem_override;
-            }
-
-            memcpy(override_params, vclk->lut[template_idx].params,
-                   sizeof(int) * (size_t)vclk->num_list);
-
-            /* Patch PLL params */
-            for (k = 0; k < vclk->num_list; k++) {
-                if (IS_PLL(vclk->list[k])) {
-                    int pll_idx =
-                        vclk_pll_idx_for_rate(vclk, k, entry->rate_khz);
-
-                    if (pll_idx >= 0) {
-                        override_params[k] = pll_idx;
-                    } else {
-                    }
-                }
-            }
-
-            /* Shift and insert */
-            for (k = current_num_rates; k > insert_idx; k--)
-                vclk->lut[k] = vclk->lut[k - 1];
-
-            vclk->lut[insert_idx].rate = entry->rate_khz;
-            vclk->lut[insert_idx].params = override_params;
-            current_num_rates++;
-
-        }
-
-        vclk->num_rates = current_num_rates;
-
-
-        if (highest_override && vclk->max_freq < highest_override) {
-            vclk->max_freq = highest_override;
-        }
-
-        if (highest_override && vclk->boot_freq == original_max_rate) {
-            vclk->boot_freq = highest_override;
-        }
-
-        if (highest_override && vclk->resume_freq == original_max_rate) {
-            vclk->resume_freq = highest_override;
-        }
-
-        if (vclk->min_freq > vclk->max_freq) {
-            vclk->min_freq = vclk->max_freq;
-        }
-
-    } else {
-        vclk->num_rates = original_num_rates;
-    }
-
-
-    /* Make sure PLL params reflect actual PLL table indices for this rate */
-    if (!vclk_has_divider(vclk))
-        vclk_normalize_pll_params(vclk);
-
-    return ret;
-
-err_nomem_override:
-    while (current_num_rates-- > 0) {
-        kfree(vclk->lut[current_num_rates].params);
-    }
+static int vclk_get_dfs_info(struct vclk *vclk)
+{
+	int i, j;
+	void *dvfs_block;
+	struct ect_dvfs_domain *dvfs_domain;
+	void *gen_block;
+	struct ect_gen_param_table *minmax = NULL;
+	unsigned int *minmax_table = NULL;
+	int *params, idx;
+	int ret = 0;
+	char buf[32];
+
+	dvfs_block = ect_get_block("DVFS");
+	if (dvfs_block == NULL)
+		return -EVCLKNOENT;
+
+	dvfs_domain = ect_dvfs_get_domain(dvfs_block, vclk->name);
+	if (dvfs_domain == NULL)
+		return -EVCLKINVAL;
+
+	gen_block = ect_get_block("GEN");
+	if (gen_block) {
+		sprintf(buf, "MINMAX_%s", vclk->name);
+		minmax = ect_gen_param_get_table(gen_block, buf);
+		if (minmax != NULL) {
+			for (i = 0; i < minmax->num_of_row; i++) {
+				minmax_table = &minmax->parameter[minmax->num_of_col * i];
+				if (minmax_table[0] == asv_table_ver)
+					break;
+			}
+		}
+	}
+
+	vclk->num_rates = dvfs_domain->num_of_level;
+	vclk->num_list = dvfs_domain->num_of_clock;
+	vclk->max_freq = dvfs_domain->max_frequency;
+	vclk->min_freq = dvfs_domain->min_frequency;
+
+	if (minmax_table != NULL) {
+		vclk->min_freq = minmax_table[MINMAX_MIN_FREQ] * 1000;
+		vclk->max_freq = minmax_table[MINMAX_MAX_FREQ] * 1000;
+	}
+	pr_debug("ACPM_DVFS :%s\n", vclk->name);
+
+	vclk->list = kzalloc(sizeof(unsigned int) * vclk->num_list, GFP_KERNEL);
+	if (!vclk->list)
+		return -EVCLKNOMEM;
+
+	vclk->lut = kzalloc(sizeof(struct vclk_lut) * vclk->num_rates,
+			    GFP_KERNEL);
+	if (!vclk->lut) {
+		ret = -EVCLKNOMEM;
+		goto err_nomem1;
+	}
+
+	for (i = 0; i < vclk->num_rates; i++) {
+		vclk->lut[i].rate = dvfs_domain->list_level[i].level;
+		params = kcalloc(vclk->num_list, sizeof(int), GFP_KERNEL);
+		if (!params) {
+			ret = -EVCLKNOMEM;
+			if (i == 0)
+				goto err_nomem2;
+			for (i = i-1; i >= 0; i--)
+				kfree(vclk->lut[i].params);
+			goto err_nomem2;
+		}
+
+		for (j = 0; j < vclk->num_list; ++j) {
+			idx = i * vclk->num_list + j;
+			params[j] = dvfs_domain->list_dvfs_value[idx];
+		}
+		vclk->lut[i].params = params;
+	}
+	vclk->boot_freq = 0;
+	vclk->resume_freq = 0;
+
+	if (minmax_table != NULL) {
+		for (i = 0; i <  vclk->num_rates; i++) {
+			if (vclk->lut[i].rate == minmax_table[MINMAX_BOOT_FREQ] * 1000)
+				vclk->boot_freq = vclk->lut[i].rate;
+		}
+
+		for (i = 0; i < vclk->num_rates; i++) {
+			if (vclk->lut[i].rate == minmax_table[MINMAX_RESUME_FREQ] * 1000)
+				vclk->resume_freq = vclk->lut[i].rate;
+		}
+	} else{
+		if (dvfs_domain->boot_level_idx != -1)
+			vclk->boot_freq = vclk->lut[dvfs_domain->boot_level_idx].rate;
+
+		if (dvfs_domain->resume_level_idx != -1)
+			vclk->resume_freq = vclk->lut[dvfs_domain->resume_level_idx].rate;
+	}
+
+	return ret;
 err_nomem2:
-    kfree(vclk->lut);
+	kfree(vclk->lut);
 err_nomem1:
-    kfree(vclk->list);
+	kfree(vclk->list);
 
-    return ret;
+	return ret;
 }
 
-static struct ect_voltage_table *
-get_max_min_freq_lv(struct ect_voltage_domain *domain, unsigned int version,
-                    int *max_lv, int *min_lv) {
-    int i;
-    unsigned int max_asv_version = 0;
-    struct ect_voltage_table *table = NULL;
+static struct ect_voltage_table *get_max_min_freq_lv(struct ect_voltage_domain *domain, unsigned int version, int *max_lv, int *min_lv)
+{
+	int i;
+	unsigned int max_asv_version = 0;
+	struct ect_voltage_table *table = NULL;
 
+	for (i = 0; i < domain->num_of_table; i++) {
+		table = &domain->table_list[i];
+		if (version == table->table_version)
+			break;
 
-    if (!domain || !max_lv || !min_lv) {
-        if (max_lv)
-            *max_lv = -1;
-        if (min_lv)
-            *min_lv = -1;
-        return NULL;
-    }
+		if (table->table_version > max_asv_version)
+			max_asv_version = table->table_version;
+	}
 
+	if (i == domain->num_of_table) {
+		pr_err("There is no voltage table, force change %d to %d\n",
+			asv_table_ver, max_asv_version);
+		asv_table_ver = max_asv_version;
+	}
 
-    /* Search requested version, track highest available version */
-    for (i = 0; i < domain->num_of_table; i++) {
-        table = &domain->table_list[i];
+	if (!table) {
+		*max_lv = -1;
+		*min_lv = -1;
+		return NULL;
+	}
 
+	*max_lv = -1;
+	*min_lv = domain->num_of_level - 1;
+	for (i = 0; i < domain->num_of_level; i++) {
+		if (*max_lv == -1 && table->level_en[i])
+			*max_lv = i;
+		if (*max_lv != -1 && !table->level_en[i]) {
+			*min_lv = i - 1;
+			break;
+		}
+	}
 
-        if (version == table->table_version) {
-            break;
-        }
-
-        if (table->table_version > max_asv_version) {
-            max_asv_version = table->table_version;
-        }
-    }
-
-    if (i == domain->num_of_table) {
-        /* NOTE: table currently points to &table_list[last] due to loop, not a
-         * match */
-        pr_err("ASV: %s: no matching voltage table: requested=%u "
-               "current_asv_table_ver=%u max_available=%u -> forcing "
-               "asv_table_ver=%u\n",
-               __func__, version, asv_table_ver, max_asv_version,
-               max_asv_version);
-        asv_table_ver = max_asv_version;
-        /* keep going: caller may re-call with updated asv_table_ver */
-    }
-
-
-    if (!table) {
-        *max_lv = -1;
-        *min_lv = -1;
-        return NULL;
-    }
-
-    *max_lv = -1;
-    *min_lv = (int)domain->num_of_level - 1;
-
-
-    for (i = 0; i < domain->num_of_level; i++) {
-        /* level_en is commonly a per-level enable bitmap/array */
-
-        if (*max_lv == -1 && table->level_en[i]) {
-            *max_lv = i;
-        }
-
-        if (*max_lv != -1 && !table->level_en[i]) {
-            *min_lv = i - 1;
-            break;
-        }
-    }
-
-
-    return table;
+	return table;
 }
 
-static int vclk_get_asv_info(struct vclk *vclk) {
-    void *asv_block;
-    struct ect_voltage_domain *domain;
-    struct ect_voltage_table *table = NULL;
-    int max_lv, min_lv;
-    int ret = 0;
-    char buf[32];
-    void *gen_block;
-    struct ect_gen_param_table *minmax = NULL;
+static int vclk_get_asv_info(struct vclk *vclk)
+{
+	void *asv_block;
+	struct ect_voltage_domain *domain;
+	struct ect_voltage_table *table = NULL;
+	int max_lv, min_lv;
+	int ret = 0;
+	char buf[32];
+	void *gen_block;
+	struct ect_gen_param_table *minmax = NULL;
 
-    if (!vclk) {
-        return -EVCLKINVAL;
-    }
+	asv_block = ect_get_block("ASV");
+	if (asv_block == NULL)
+		return -EVCLKNOENT;
 
+	domain = ect_asv_get_domain(asv_block, vclk->name);
+	if (domain == NULL)
+		return -EVCLKINVAL;
 
-    asv_block = ect_get_block("ASV");
-    if (asv_block == NULL) {
-        return -EVCLKNOENT;
-    }
+	gen_block = ect_get_block("GEN");
+	if (gen_block) {
+		sprintf(buf, "MINMAX_%s", vclk->name);
+		minmax = ect_gen_param_get_table(gen_block, buf);
+		if (minmax != NULL)
+			goto minmax_skip;
+	}
 
-    domain = ect_asv_get_domain(asv_block, vclk->name);
-    if (domain == NULL) {
-        return -EVCLKINVAL;
-    }
+	table = get_max_min_freq_lv(domain, asv_table_ver, &max_lv, &min_lv);
+	if (table == NULL)
+		return -EVCLKFAULT;
 
-    /* Domain-level visibility (pointers + key fields if present) */
+	if (max_lv >= 0)
+		vclk->max_freq = domain->level_list[max_lv] * 1000;
+	else
+		vclk->max_freq = -1;
 
-    gen_block = ect_get_block("GEN");
+	if (min_lv >= 0)
+		vclk->min_freq = domain->level_list[min_lv] * 1000;
+	else
+		vclk->min_freq = -1;
 
-    if (gen_block) {
-        snprintf(buf, sizeof(buf), "MINMAX_%s",
-                 vclk->name ? vclk->name : "(null)");
+	if (table->boot_level_idx >= 0)
+		vclk->boot_freq = domain->level_list[table->boot_level_idx] * 1000;
+	else
+		vclk->boot_freq = -1;
 
-        minmax = ect_gen_param_get_table(gen_block, buf);
-
-        if (minmax != NULL) {
-            goto minmax_skip;
-        }
-    } else {
-    }
-
-    table = get_max_min_freq_lv(domain, asv_table_ver, &max_lv, &min_lv);
-
-    if (table == NULL) {
-        return -EVCLKFAULT;
-    }
-
-    /* Compute and log derived freqs (kHz -> Hz via *1000) */
-    if (max_lv >= 0) {
-        vclk->max_freq = domain->level_list[max_lv] * 1000;
-    } else {
-        vclk->max_freq = -1;
-    }
-
-    if (min_lv >= 0) {
-        vclk->min_freq = domain->level_list[min_lv] * 1000;
-    } else {
-        vclk->min_freq = -1;
-    }
-
-
-    if (table->boot_level_idx >= 0) {
-        vclk->boot_freq = domain->level_list[table->boot_level_idx] * 1000;
-    } else {
-        vclk->boot_freq = -1;
-    }
-
-    if (table->resume_level_idx >= 0) {
-        vclk->resume_freq = domain->level_list[table->resume_level_idx] * 1000;
-    } else {
-        vclk->resume_freq = -1;
-    }
+	if (table->resume_level_idx >= 0)
+		vclk->resume_freq = domain->level_list[table->resume_level_idx] * 1000;
+	else
+		vclk->resume_freq = -1;
 
 minmax_skip:
+	pr_debug("   num_rates    : %7d\n", vclk->num_rates);
+	pr_debug("   num_clk_list : %7d\n", vclk->num_list);
+	pr_debug("   max_freq     : %7d\n", vclk->max_freq);
+	pr_debug("   min_freq     : %7d\n", vclk->min_freq);
+	pr_debug("   boot_freq    : %7d\n", vclk->boot_freq);
+	pr_debug("   resume_freq  : %7d\n", vclk->resume_freq);
 
-    return ret;
+	return ret;
 }
 
-static void vclk_bind(void) {
-    struct vclk *vclk;
-    int i;
-    bool warn_on = 0;
-    int ret;
+static void vclk_bind(void)
+{
+	struct vclk *vclk;
+	int i;
+	bool warn_on = 0;
+	int ret;
 
-    for (i = 0; i < cmucal_get_list_size(ACPM_VCLK_TYPE); i++) {
-        vclk = cmucal_get_node(ACPM_VCLK_TYPE | i);
-        if (!vclk) {
-            pr_err("cannot found vclk node %x\n", i);
-            continue;
-        }
+	for (i = 0; i < cmucal_get_list_size(ACPM_VCLK_TYPE); i++) {
+		vclk = cmucal_get_node(ACPM_VCLK_TYPE | i);
+		if (!vclk) {
+			pr_err("cannot found vclk node %x\n", i);
+			continue;
+		}
 
-        ret = vclk_get_dfs_info(vclk);
-        if (ret == -EVCLKNOENT) {
-            if (!warn_on)
-                pr_warn("ECT DVFS not found\n");
-            warn_on = 1;
-        } else if (ret) {
-            pr_err("ECT DVFS [%s] not found %d\n", vclk->name, ret);
-        } else {
-            ret = vclk_get_asv_info(vclk);
-            if (ret)
-                pr_err("ECT ASV [%s] not found %d\n", vclk->name, ret);
-        }
-    }
+		ret = vclk_get_dfs_info(vclk);
+		if (ret == -EVCLKNOENT) {
+			if (!warn_on)
+				pr_warn("ECT DVFS not found\n");
+			warn_on = 1;
+		} else if (ret) {
+			pr_err("ECT DVFS [%s] not found %d\n",
+				   vclk->name, ret);
+		} else {
+			ret = vclk_get_asv_info(vclk);
+			if (ret)
+				pr_err("ECT ASV [%s] not found %d\n",
+					vclk->name, ret);
+		}
+	}
 }
 
-int vclk_register_ops(unsigned int id, struct vclk_trans_ops *ops) {
-    struct vclk *vclk;
+int vclk_register_ops(unsigned int id, struct vclk_trans_ops *ops)
+{
+	struct vclk *vclk;
 
-    if (IS_DFS_VCLK(id)) {
-        vclk = cmucal_get_node(id);
-        if (!vclk)
-            return -EVCLKINVAL;
-        vclk->ops = ops;
+	if (IS_DFS_VCLK(id)) {
+		vclk = cmucal_get_node(id);
+		if (!vclk)
+			return -EVCLKINVAL;
+		vclk->ops = ops;
 
-        return 0;
-    }
+		return 0;
+	}
 
-    return -EVCLKNOENT;
+	return -EVCLKNOENT;
 }
 
-int __init vclk_initialize(void) {
+int __init vclk_initialize(void)
+{
+	pr_info("vclk initialize for cmucal\n");
 
-    ra_init();
+	ra_init();
 
-    asv_table_ver = asv_table_init();
-    id_get_rev(&main_rev, &sub_rev);
+	asv_table_ver = asv_table_init();
+	id_get_rev(&main_rev, &sub_rev);
 
-    vclk_bind();
+	vclk_bind();
 
-    return 0;
+	return 0;
 }

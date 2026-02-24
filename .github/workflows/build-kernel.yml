@@ -1,32 +1,67 @@
 name: Build Kernel
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
+    inputs:
+      model:
+        description: Model (code + device name)
+        required: true
+        default: beyondx (Galaxy S10 5G)
+        type: choice
+        options:
+          - beyond0lte (Galaxy S10e)
+          - beyond1lte (Galaxy S10)
+          - beyond2lte (Galaxy S10+)
+          - beyondx (Galaxy S10 5G)
+          - d1 (Galaxy Note10)
+          - d1xks (Galaxy Note10 5G)
+          - d2s (Galaxy Note10+)
+          - d2x (Galaxy Note10+ 5G)
+          - d2xks (Galaxy Note10+ 5G Korea)
+      include_ksu:
+        description: Include KernelSU
+        required: true
+        default: y
+        type: choice
+        options:
+          - y
+          - n
+      recovery:
+        description: Compile for Android Recovery (disables KernelSU)
+        required: true
+        default: n
+        type: choice
+        options:
+          - n
+          - y
+      gpu_max:
+        description: GPU max MHz (forOC tables, default: 702)
+        required: true
+        default: "702"
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        model:
-         # - beyond0lte
-         # - beyond1lte
-         # - beyond2lte
-          - beyondx
-         # - d1
-         # - d1xks
-         # - d2s
-         # - d2x
-         # - d2xks
-         
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Resolve model code
+        id: model
+        shell: bash
+        run: |
+          MODEL_CODE="${{ inputs.model }}"
+          MODEL_CODE="${MODEL_CODE%% *}"
+          echo "model_code=$MODEL_CODE" >> "$GITHUB_OUTPUT"
+          echo "Selected model input: ${{ inputs.model }}"
+          echo "Resolved model code: $MODEL_CODE"
 
       - name: Install dependencies
         run: |
@@ -55,24 +90,28 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-${{ runner.os }}-${{ matrix.model }}-${{ hashFiles('build.sh') }}
+          key: ccache-${{ runner.os }}-${{ steps.model.outputs.model_code }}-${{ inputs.include_ksu }}-${{ inputs.recovery }}-${{ inputs.gpu_max }}-${{ hashFiles('build.sh') }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ matrix.model }}-
+            ccache-${{ runner.os }}-${{ steps.model.outputs.model_code }}-
 
       - name: Configure ccache
         run: |
-          echo "CCACHE_DIR=$HOME/.cache/ccache" >> $GITHUB_ENV
-          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> $GITHUB_ENV
-          echo "CCACHE_COMPILERCHECK=content" >> $GITHUB_ENV
-          echo "CCACHE_NOHASHDIR=1" >> $GITHUB_ENV
-          echo "CCACHE_SLOPPINESS=file_macro,locale,time_macros" >> $GITHUB_ENV
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
+          echo "CCACHE_NOHASHDIR=1" >> "$GITHUB_ENV"
+          echo "CCACHE_SLOPPINESS=file_macro,locale,time_macros" >> "$GITHUB_ENV"
           ccache --max-size=3G
           ccache -s
 
       - name: Build kernel
         run: |
           chmod +x build.sh
-          ./build.sh --model ${{ matrix.model }} --ksu y
+          ./build.sh \
+            --model "${{ steps.model.outputs.model_code }}" \
+            --ksu "${{ inputs.include_ksu }}" \
+            --recovery "${{ inputs.recovery }}" \
+            --gpu-max "${{ inputs.gpu_max }}"
 
       - name: ccache stats after build
         run: ccache -s
@@ -80,7 +119,11 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-build-${{ matrix.model }}
+          name: kernel-build-${{ steps.model.outputs.model_code }}-ksu${{ inputs.include_ksu }}-rec${{ inputs.recovery }}-gpu${{ inputs.gpu_max }}
           path: |
+            build/out/**/Image
+            build/out/**/boot.img
+            build/out/**/dtb.img
+            build/out/**/dtbo.img
             build/out/**/zip/*.zip
           if-no-files-found: warn

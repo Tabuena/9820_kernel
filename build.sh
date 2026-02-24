@@ -167,7 +167,7 @@ while [[ $# -gt 0 ]]; do
             RECOVERY_OPTION="$2"
             shift 2
             ;;
-        *)\
+        *)
             unset_flags
             exit 1
             ;;

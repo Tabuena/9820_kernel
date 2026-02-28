@@ -147,7 +147,8 @@ write_cal()
 PY
 }
 
-DEFAULT_GPU_MAX=702
+DEFAULT_GPU_MAX_BEYOND=702
+DEFAULT_GPU_MAX_D=754
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -282,7 +283,11 @@ if [[ "$KSU_OPTION" == "y" ]]; then
 fi
 
 if [ -z "$GPU_MAX" ]; then
-    GPU_MAX=$DEFAULT_GPU_MAX
+    if [[ "$MODEL" == d* ]]; then
+        GPU_MAX=$DEFAULT_GPU_MAX_D
+    else
+        GPU_MAX=$DEFAULT_GPU_MAX_BEYOND
+    fi
 fi
 
 if [ -n "$GPU_MAX" ]; then

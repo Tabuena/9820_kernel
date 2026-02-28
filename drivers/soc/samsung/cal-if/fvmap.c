@@ -17,7 +17,6 @@
 
 #define FVMAP_SIZE		(SZ_8K)
 #define STEP_UV			(6250)
-#define G3D_DEFAULT_MARGIN_PERCENT	(5)
 
 void __iomem *fvmap_base;
 void __iomem *sram_fvmap_base;
@@ -328,58 +327,6 @@ static int get_vclk_id_from_margin_id(int margin_id)
 	return -EINVAL;
 }
 
-static int quantize_margin_uv(int uv)
-{
-	if (uv >= 0)
-		return rounddown(uv, STEP_UV);
-
-	return -rounddown(-uv, STEP_UV);
-}
-
-static int percent_to_margin_uv(unsigned int id, int percent, int *margin_uv)
-{
-	unsigned int volt_table[48];
-	unsigned int base_uv = 0;
-	int entries;
-	int i;
-	long scaled_uv;
-
-	if (!margin_uv)
-		return -EINVAL;
-
-	entries = cal_dfs_get_asv_table(id, volt_table);
-	if (entries <= 0)
-		return -EINVAL;
-
-	if (entries > ARRAY_SIZE(volt_table))
-		entries = ARRAY_SIZE(volt_table);
-
-	for (i = 0; i < entries; i++)
-		if (volt_table[i] > base_uv)
-			base_uv = volt_table[i];
-
-	scaled_uv = ((long)base_uv * (long)percent) / 100L;
-	*margin_uv = quantize_margin_uv((int)scaled_uv);
-
-	return 0;
-}
-
-static void apply_default_g3d_margin(unsigned int id, int boot_margin_uv)
-{
-	int margin_uv;
-	int ret;
-
-	if (boot_margin_uv)
-		return;
-
-	ret = percent_to_margin_uv(id, G3D_DEFAULT_MARGIN_PERCENT, &margin_uv);
-	if (ret)
-		return;
-
-	percent_margin_table[MARGIN_G3D] = G3D_DEFAULT_MARGIN_PERCENT;
-	cal_dfs_set_volt_margin(id, margin_uv);
-}
-
 #define attr_percent(margin_id, type)								\
 static ssize_t show_##type##_percent								\
 (struct kobject *kobj, struct kobj_attribute *attr, char *buf)					\
@@ -390,7 +337,7 @@ static ssize_t show_##type##_percent								\
 static ssize_t store_##type##_percent								\
 (struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)		\
 {												\
-	int input, vclk_id, margin_uv, ret;							\
+	int input, vclk_id;									\
 												\
 	if (!sscanf(buf, "%d", &input))								\
 		return -EINVAL;									\
@@ -401,11 +348,8 @@ static ssize_t store_##type##_percent								\
 	vclk_id = get_vclk_id_from_margin_id(margin_id);					\
 	if (vclk_id == -EINVAL)									\
 		return vclk_id;									\
-	ret = percent_to_margin_uv(vclk_id | ACPM_VCLK_TYPE, input, &margin_uv);			\
-	if (ret)										\
-		return ret;									\
 	percent_margin_table[margin_id] = input;						\
-	cal_dfs_set_volt_margin(vclk_id | ACPM_VCLK_TYPE, margin_uv);				\
+	cal_dfs_set_volt_margin(vclk_id | ACPM_VCLK_TYPE, input);				\
 												\
 	return count;										\
 }												\
@@ -569,8 +513,6 @@ static void fvmap_copy_from_sram(void __iomem *map_base, void __iomem *sram_base
 					   old_lv);
 			if (ret)
 				pr_err("G3D: manual override failed: %d\n", ret);
-			apply_default_g3d_margin(i | ACPM_VCLK_TYPE,
-						 init_margin_table[MARGIN_G3D]);
 			continue;
 		}
 

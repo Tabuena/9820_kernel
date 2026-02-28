@@ -60,6 +60,8 @@ on:
           - "1014"
           - "1066"
           - "1092"
+          - "1118"
+          - "1144"
 
 permissions:
   contents: read

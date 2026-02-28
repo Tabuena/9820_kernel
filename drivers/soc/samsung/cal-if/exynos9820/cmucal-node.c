@@ -56,6 +56,8 @@ struct cmucal_pll_table apll_shared1_rate_table[] = {
 };
 
 struct cmucal_pll_table pll_g3d_rate_table[] = {
+    PLL_RATE_MPS(1144000000, 176, 4, 0),
+    PLL_RATE_MPS(1118000000, 172, 4, 0),
     PLL_RATE_MPS(1092000000, 168, 4, 0),
     PLL_RATE_MPS(1066000000, 164, 4, 0),
     PLL_RATE_MPS(1014000000, 156, 4, 0),

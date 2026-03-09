@@ -45,9 +45,13 @@ pushd "$(dirname "$0")" > /dev/null
 
 MODELS=(
     beyond0lte
+    beyond0lteks
     beyond1lte
+    beyond1lteks
     beyond2lte
+    beyond2lteks
     beyondx
+    beyondxks
     d1
     d1xks
     d2s
@@ -77,9 +81,6 @@ for model in "${MODELS[@]}"; do
     ./build.sh "${args[@]}"
 
     model_out_dir="build/out/$model/zip"
-    if [[ "$model" == "d2xks" ]]; then
-        model_out_dir="build/out/d2x/zip"
-    fi
 
     latest_zip="$(ls -1t "$model_out_dir"/*.zip 2>/dev/null | head -n 1 || true)"
     if [[ -z "$latest_zip" ]]; then

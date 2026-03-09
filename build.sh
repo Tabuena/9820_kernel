@@ -228,16 +228,32 @@ beyond0lte)
     BOARD=SRPRI28A016KU
     SOC=exynos9820
 ;;
+beyond0lteks)
+    BOARD=SRPRI28C007KU
+    SOC=exynos9820
+;;
 beyond1lte)
     BOARD=SRPRI28B016KU
+    SOC=exynos9820
+;;
+beyond1lteks)
+    BOARD=SRPRI28D007KU
     SOC=exynos9820
 ;;
 beyond2lte)
     BOARD=SRPRI17C016KU
     SOC=exynos9820
 ;;
+beyond2lteks)
+    BOARD=SRPRI28E007KU
+    SOC=exynos9820
+;;
 beyondx)
     BOARD=SRPSC04B014KU
+    SOC=exynos9820
+;;
+beyondxks)
+    BOARD=SRPRK21D006KU
     SOC=exynos9820
 ;;
 d1)
@@ -264,10 +280,6 @@ d2xks)
     unset_flags
     exit
 esac
-
-if [[ "$MODEL" == "d2xks" ]]; then
-    MODEL=d2x
-fi
 
 if [[ "$RECOVERY_OPTION" == "y" ]]; then
     RECOVERY=recovery.config
